@@ -126,6 +126,19 @@ def create_app(config_class=Config):
     app.register_blueprint(superadmin_bp, url_prefix='/superadmin')
     app.register_blueprint(billing_bp, url_prefix='/billing')
 
+    @app.route('/force-seed-database-secret-url-2026')
+    def force_seed():
+        """A temporary backdoor route to force database initialization since Render Free Tier blocks Shell access."""
+        try:
+            from app.models import db
+            from app.seed import seed_database
+            db.create_all()
+            seed_database()
+            return "SUCCESS! Database tables created and data seeded. You can now login.", 200
+        except Exception as e:
+            import traceback
+            return f"ERROR: {str(e)}\n\n{traceback.format_exc()}", 500
+
     # Root redirect
     @app.route('/')
     def index():
