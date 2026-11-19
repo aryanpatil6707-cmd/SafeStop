@@ -5,8 +5,12 @@ set -o errexit
 pip install -r requirements.txt
 
 # Reset the database completely to clear corrupted tables
-# We downgrade to base to wipe everything, then upgrade back to head
-flask db downgrade base || echo "Downgrade failed, moving on..."
+# We use flask shell to drop tables ignoring migrations
+cat << EOF | flask shell
+from app.models import db
+db.drop_all()
+EOF
+
 flask db upgrade
 
 # Re-seed the clean database
