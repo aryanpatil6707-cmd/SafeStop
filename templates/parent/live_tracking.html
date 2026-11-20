@@ -61,7 +61,7 @@
                         </span>
                     </div>
                     <div id="trip-type-label" class="fw-bold text-info mt-1 fs-6">
-                        {{ active_trip.trip_type.replace('_', ' ') if active_trip else 'DRIVER OFF-DUTY' }}
+                        {{ active_trip.trip_type.replace('_', ' ') if active_trip and hasattr(active_trip, 'trip_type') else 'DRIVER OFF-DUTY' }}
                     </div>
                 </div>
 
