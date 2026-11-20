@@ -4,8 +4,8 @@ class BusTrackerMap {
     constructor(mapContainerId, initialLat = 19.0760, initialLng = 72.8777, zoom = 13) {
         this.map = L.map(mapContainerId).setView([initialLat, initialLng], zoom);
         
-        // High quality crisp tile layer
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+        // High quality crisp tile layer - Switched to OpenStreetMap default since CartoDB might have CORS/Key issues on some networks
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '&copy; SafeRide AI | OpenStreetMap',
             maxZoom: 19
         }).addTo(this.map);
