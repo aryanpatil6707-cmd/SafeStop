@@ -97,19 +97,21 @@
             <div class="glass-card p-4">
                 <h6 class="fw-bold text-white mb-3"><i class="fa-solid fa-list-ol text-primary me-2"></i> Route Stops</h6>
                 <div class="timeline text-white-50 small">
-                    {% for stop in route.stops.order_by(route.stops.model.sequence_order).all() if route %}
+                    {% if stops_json %}
+                    {% for stop in stops_json %}
                     <div class="p-2 mb-2 rounded bg-dark border border-secondary border-opacity-25 d-flex align-items-center justify-content-between">
                         <div>
-                            <span class="badge {{ 'bg-success' if stop.id == student.pickup_stop_id else ('bg-purple' if stop.id == student.drop_stop_id else 'bg-primary') }} me-2">{{ stop.sequence_order }}</span>
-                            <span class="fw-semibold text-white">{{ stop.stop_name }}</span>
-                            {% if stop.id == student.pickup_stop_id %}<span class="badge bg-success ms-1">Child Pickup</span>{% endif %}
-                            {% if stop.id == student.drop_stop_id %}<span class="badge bg-info ms-1">Child Drop</span>{% endif %}
+                            <span class="badge {{ 'bg-success' if stop.is_child_pickup else ('bg-info' if stop.is_child_drop else 'bg-primary') }} me-2">{{ stop.sequence }}</span>
+                            <span class="fw-semibold text-white">{{ stop.name }}</span>
+                            {% if stop.is_child_pickup %}<span class="badge bg-success ms-1">Child Pickup</span>{% endif %}
+                            {% if stop.is_child_drop %}<span class="badge bg-info ms-1">Child Drop</span>{% endif %}
                         </div>
-                        <span class="text-muted small">{{ stop.scheduled_pickup_time or 'N/A' }}</span>
+                        <span class="text-muted small">{{ stop.pickup_time or 'N/A' }}</span>
                     </div>
+                    {% endfor %}
                     {% else %}
                     <div class="text-muted">No stops defined for route.</div>
-                    {% endfor %}
+                    {% endif %}
                 </div>
             </div>
         </div>
