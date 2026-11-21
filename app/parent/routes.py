@@ -114,7 +114,7 @@ def live_tracking(student_id):
 
     # Child's current location & boarding status
     latest_att = Attendance.query.filter_by(student_id=student.id).order_by(Attendance.verification_time.desc()).first()
-    safe_drop = SafeDropConfirmation.query.filter_by(student_id=student.id).order_by(SafeDropConfirmation.created_at.desc()).first()
+    safe_drop = SafeDropConfirmation.query.filter_by(student_id=student.id).order_by(SafeDropConfirmation.bus_arrival_time.desc()).first()
 
     child_status = 'WAITING_PICKUP'
     child_status_label = 'Waiting at Pickup Stop'
