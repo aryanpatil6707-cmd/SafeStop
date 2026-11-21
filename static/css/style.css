@@ -234,12 +234,27 @@ body {
     border-color: #e2e8f0 !important;
 }
 
+/* Fix text colors inside glass cards to contrast properly against light backgrounds */
+.glass-card .text-white {
+    color: #0f172a !important;
+}
+.glass-card .text-white-50 {
+    color: #475569 !important;
+}
+
+.table-responsive {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    width: 100%;
+}
+
 .table-dark {
     --bs-table-bg: #ffffff;
     --bs-table-color: #0f172a;
     --bs-table-border-color: #e2e8f0;
     --bs-table-hover-bg: #f8fafc;
     color: #0f172a !important;
+    white-space: nowrap; /* Prevent table cells from wrapping uncomfortably on mobile */
 }
 
 .table-dark thead th {
