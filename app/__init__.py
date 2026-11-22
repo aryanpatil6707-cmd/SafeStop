@@ -79,11 +79,33 @@ def create_app(config_class=Config):
     # Error Handlers
     @app.errorhandler(400)
     def bad_request_error(e):
-        return jsonify({'status': 'ERROR', 'message': str(e.description or e)}), 400
+        from flask import request, render_template
+        if request.path.startswith('/api/'):
+            return jsonify({'status': 'ERROR', 'message': str(e.description or e)}), 400
+        return render_template('errors/400.html'), 400
 
     @app.errorhandler(403)
     def forbidden_error(e):
-        return jsonify({'status': 'ERROR', 'message': 'Access Denied: Unauthorized resource access.'}), 403
+        from flask import request, render_template
+        if request.path.startswith('/api/'):
+            return jsonify({'status': 'ERROR', 'message': 'Access Denied: Unauthorized resource access.'}), 403
+        return render_template('errors/403.html'), 403
+
+    @app.errorhandler(404)
+    def not_found_error(e):
+        from flask import request, render_template
+        if request.path.startswith('/api/'):
+            return jsonify({'status': 'ERROR', 'message': 'Resource not found.'}), 404
+        return render_template('errors/404.html'), 404
+
+    @app.errorhandler(500)
+    def internal_error(e):
+        from flask import request, render_template
+        from app.models import db
+        db.session.rollback()
+        if request.path.startswith('/api/'):
+            return jsonify({'status': 'ERROR', 'message': 'Internal Server Error.'}), 500
+        return render_template('errors/500.html'), 500
 
     # Context processors for navbar alerts & counts & feature flags
     @app.context_processor
