@@ -16,10 +16,21 @@
         </div>
     </div>
 
-    <div class="row g-4">
+    <div class="row g-4 d-flex flex-column-reverse flex-lg-row">
         <!-- Live Map View (Main Column) -->
         <div class="col-lg-8 col-xl-9">
             <div class="glass-card p-3">
+                <!-- Stale Location Banner -->
+                <div id="stale-banner" class="alert alert-warning py-2 px-3 mb-2 d-none shadow-sm border border-warning" role="alert">
+                    <div class="d-flex align-items-center">
+                        <i class="fa-solid fa-triangle-exclamation fs-4 me-3"></i>
+                        <div>
+                            <strong class="d-block mb-1">Location delayed!</strong>
+                            <span class="small" id="stale-banner-text">The driver's device hasn't sent a GPS signal in over 2 minutes. The bus location shown on the map may be outdated.</span>
+                        </div>
+                    </div>
+                </div>
+
                 <div id="map"></div>
             </div>
         </div>
@@ -159,11 +170,13 @@ document.addEventListener("DOMContentLoaded", function() {
             const tripTypeLabel = document.getElementById('trip-type-label');
             const etaDisplay = document.getElementById('eta-display');
             const etaSubtext = document.getElementById('eta-subtext');
+            const staleBanner = document.getElementById('stale-banner');
+            const staleBannerText = document.getElementById('stale-banner-text');
 
             if (data.status === 'ACTIVE' && data.lat && data.lng) {
                 if (statusBadge) {
-                    statusBadge.className = 'badge bg-success';
-                    statusBadge.innerText = 'DRIVER ACTIVE (LIVE)';
+                    statusBadge.className = data.is_stale ? 'badge bg-warning text-dark' : 'badge bg-success';
+                    statusBadge.innerText = data.is_stale ? 'DRIVER ACTIVE (DELAYED)' : 'DRIVER ACTIVE (LIVE)';
                 }
                 if (tripTypeLabel && data.trip_type) {
                     tripTypeLabel.innerText = data.trip_type.replace('_', ' ');
@@ -172,6 +185,19 @@ document.addEventListener("DOMContentLoaded", function() {
 
                 if (etaDisplay) etaDisplay.innerText = data.delay_minutes > 0 ? `Delayed +${data.delay_minutes}m` : 'In Transit (Live GPS)';
                 if (etaSubtext) etaSubtext.innerText = `Updating from driver mobile (${data.last_updated_formatted || 'now'})`;
+
+                // Toggle stale banner visibility
+                if (staleBanner) {
+                    if (data.is_stale) {
+                        staleBanner.classList.remove('d-none');
+                        if (staleBannerText && data.last_updated_formatted) {
+                            staleBannerText.innerText = `The driver's device hasn't sent a GPS signal in over 2 minutes (${data.last_updated_formatted}). The bus location shown on the map may be outdated.`;
+                        }
+                    } else {
+                        staleBanner.classList.add('d-none');
+                    }
+                }
+
             } else if (data.status === 'WAITING_GPS') {
                 if (statusBadge) {
                     statusBadge.className = 'badge bg-info text-dark';
