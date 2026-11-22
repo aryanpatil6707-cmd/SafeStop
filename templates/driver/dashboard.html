@@ -231,9 +231,25 @@
 {% block extra_js %}
 <div id="driver-config" data-trip-id="{{ active_trip.id if active_trip else '' }}" data-is-online="{{ 'true' if driver.is_online else 'false' }}"></div>
 <script>
-let gpsIntervalTimer = null;
+let gpsWatchId = null;
+let wakeLock = null;
 let isDriverOnline = document.getElementById('driver-config')?.dataset.isOnline === 'true';
 const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+
+// Wake Lock API to prevent screen from sleeping while driving
+async function requestWakeLock() {
+    try {
+        if ('wakeLock' in navigator) {
+            wakeLock = await navigator.wakeLock.request('screen');
+            wakeLock.addEventListener('release', () => {
+                console.log('Wake Lock was released');
+            });
+            console.log('Wake Lock is active');
+        }
+    } catch (err) {
+        console.error(`${err.name}, ${err.message}`);
+    }
+}
 
 function updateLocationOnServer(lat, lng) {
     const tripIdAttr = document.getElementById('driver-config')?.dataset.tripId;
@@ -241,7 +257,7 @@ function updateLocationOnServer(lat, lng) {
 
     const coordsEl = document.getElementById('telemetry-coords');
     const tsEl = document.getElementById('telemetry-timestamp');
-    if (coordsEl) coordsEl.innerText = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    if (coordsEl) coordsEl.innerHTML = `<span class="text-success">${lat.toFixed(5)}, ${lng.toFixed(5)}</span>`;
     if (tsEl) tsEl.innerText = new Date().toLocaleTimeString();
 
     fetch("{{ url_for('driver.api_gps_update') }}", {
@@ -258,47 +274,73 @@ function updateLocationOnServer(lat, lng) {
     }).then(res => res.json()).then(data => {
         if(data.status === 'SUCCESS') {
             const feedback = document.getElementById('gps-live-feedback');
-            if(feedback) feedback.innerHTML = '<i class="fa-solid fa-satellite-dish me-1"></i> Mobile GPS Streaming Active';
+            if(feedback) feedback.innerHTML = '<i class="fa-solid fa-satellite-dish me-1 fa-fade text-success"></i> <span class="text-success">Live GPS Broadcasting Active</span>';
             const busStatusEl = document.getElementById('telemetry-bus-status');
             if(busStatusEl && data.bus_status) busStatusEl.innerText = data.bus_status;
         }
     }).catch(err => {
         console.warn("GPS sync warning:", err);
+        const feedback = document.getElementById('gps-live-feedback');
+        if (feedback) feedback.innerHTML = '<i class="fa-solid fa-triangle-exclamation me-1 text-danger"></i> <span class="text-danger">GPS Connection Lost</span>';
     });
+}
+
+function showInlineAlert(type, message) {
+    const alertDiv = document.createElement('div');
+    alertDiv.className = `alert alert-${type === 'error' ? 'danger' : 'success'} alert-dismissible fade show fixed-top m-3 shadow-lg`;
+    alertDiv.innerHTML = `
+        <strong>${type === 'error' ? '<i class="fa-solid fa-triangle-exclamation me-1"></i> Error' : '<i class="fa-solid fa-circle-check me-1"></i> Success'}!</strong> ${message}
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+    `;
+    document.body.prepend(alertDiv);
+    setTimeout(() => alertDiv.remove(), 5000);
 }
 
 function startMobileGpsTracking() {
     if (!navigator.geolocation) {
-        alert("Geolocation API is not supported by your browser/device.");
+        showInlineAlert("error", "Geolocation API is not supported by your browser/device.");
         return;
     }
 
-    navigator.geolocation.getCurrentPosition(pos => {
-        updateLocationOnServer(pos.coords.latitude, pos.coords.longitude);
-        const accEl = document.getElementById('telemetry-accuracy');
-        if (accEl && pos.coords.accuracy) {
-            accEl.innerText = `±${Math.round(pos.coords.accuracy)}m`;
-        }
-    }, err => {
-        console.warn("Initial GPS fix error:", err.message);
-    }, { enableHighAccuracy: true });
+    // Request screen wake lock
+    requestWakeLock();
 
-    if (gpsIntervalTimer) clearInterval(gpsIntervalTimer);
-    gpsIntervalTimer = setInterval(() => {
-        navigator.geolocation.getCurrentPosition(pos => {
+    // Re-acquire wake lock if page becomes visible again
+    document.addEventListener('visibilitychange', async () => {
+        if (wakeLock !== null && document.visibilityState === 'visible' && isDriverOnline) {
+            await requestWakeLock();
+        }
+    });
+
+    const feedback = document.getElementById('gps-live-feedback');
+    if (feedback) feedback.innerHTML = '<i class="fa-solid fa-spinner fa-spin me-1 text-warning"></i> <span class="text-warning">Acquiring GPS Signal...</span>';
+
+    // Use watchPosition instead of intervals for better battery & accuracy
+    if (gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId);
+
+    gpsWatchId = navigator.geolocation.watchPosition(
+        (pos) => {
             updateLocationOnServer(pos.coords.latitude, pos.coords.longitude);
             const accEl = document.getElementById('telemetry-accuracy');
             if (accEl && pos.coords.accuracy) {
                 accEl.innerText = `±${Math.round(pos.coords.accuracy)}m`;
             }
-        }, err => console.warn("Mobile GPS stream error:", err.message), { enableHighAccuracy: true, timeout: 4500 });
-    }, 5000);
+        },
+        (err) => {
+            console.warn("Mobile GPS stream error:", err.message);
+            if (feedback) feedback.innerHTML = '<i class="fa-solid fa-satellite-dish me-1 text-danger"></i> <span class="text-danger">GPS Signal Lost</span>';
+        },
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+    );
 }
 
 function stopMobileGpsTracking() {
-    if (gpsIntervalTimer) {
-        clearInterval(gpsIntervalTimer);
-        gpsIntervalTimer = null;
+    if (gpsWatchId) {
+        navigator.geolocation.clearWatch(gpsWatchId);
+        gpsWatchId = null;
+    }
+    if (wakeLock !== null) {
+        wakeLock.release().then(() => { wakeLock = null; });
     }
     const coordsEl = document.getElementById('telemetry-coords');
     if (coordsEl) coordsEl.innerText = '-- , --';
@@ -327,12 +369,12 @@ async function toggleDriverOnlineStatus() {
             isDriverOnline = data.is_online;
             window.location.reload();
         } else {
-            alert(data.message || "Failed to toggle online status.");
-            window.location.reload();
+            showInlineAlert("error", data.message || "Failed to toggle online status.");
+            setTimeout(() => window.location.reload(), 2000);
         }
     } catch(e) {
-        alert("Network error updating driver online status.");
-        window.location.reload();
+        showInlineAlert("error", "Network error updating driver online status.");
+        setTimeout(() => window.location.reload(), 2000);
     }
 }
 
@@ -347,34 +389,40 @@ function triggerSosNow() {
     const tripIdAttr = document.getElementById('driver-config')?.dataset.tripId;
     const tripId = tripIdAttr ? parseInt(tripIdAttr, 10) : null;
     
-    navigator.geolocation.getCurrentPosition(async (pos) => {
-        const payload = {
-            trip_id: tripId,
-            latitude: pos.coords.latitude,
-            longitude: pos.coords.longitude,
-            description: desc
-        };
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(async (pos) => {
+            const payload = {
+                trip_id: tripId,
+                latitude: pos.coords.latitude,
+                longitude: pos.coords.longitude,
+                description: desc
+            };
 
-        const res = await fetch('/driver/api/trigger-sos', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(payload)
-        });
-
-        const data = await res.json();
-        alert("🚨 EMERGENCY SOS BROADCASTED TO SCHOOL TRANSPORT CENTER!");
-        window.location.reload();
-    }, (err) => {
-        alert("Sending SOS with default location...");
-        fetch('/driver/api/trigger-sos', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ trip_id: tripId, description: desc })
-        }).then(() => {
-            alert("🚨 SOS BROADCASTED!");
-            window.location.reload();
-        });
-    });
+            try {
+                const res = await fetch('/driver/api/trigger-sos', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                    body: JSON.stringify(payload)
+                });
+                showInlineAlert("success", "🚨 EMERGENCY SOS BROADCASTED TO SCHOOL TRANSPORT CENTER!");
+                setTimeout(() => window.location.reload(), 3000);
+            } catch (err) {
+                showInlineAlert("error", "Failed to reach server. Try again!");
+            }
+        }, (err) => {
+            showInlineAlert("warning", "Sending SOS with default location...");
+            fetch('/driver/api/trigger-sos', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                body: JSON.stringify({ trip_id: tripId, description: desc })
+            }).then(() => {
+                showInlineAlert("success", "🚨 SOS BROADCASTED!");
+                setTimeout(() => window.location.reload(), 3000);
+            });
+        }, { enableHighAccuracy: true });
+    } else {
+        showInlineAlert("error", "Geolocation not supported.");
+    }
 }
 </script>
 {% endblock %}
