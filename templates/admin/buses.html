@@ -48,6 +48,8 @@
                             </a>
                         </td>
                     </tr>
+                    {% else %}
+                    <tr><td colspan="6" class="text-center text-muted py-5"><i class="fa-solid fa-bus fa-2x mb-3 text-secondary d-block"></i>No buses currently registered in the fleet. Click "Add New Bus" to get started.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>

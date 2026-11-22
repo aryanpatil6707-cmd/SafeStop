@@ -57,6 +57,8 @@
                             </form>
                         </td>
                     </tr>
+                    {% else %}
+                    <tr><td colspan="7" class="text-center text-muted py-5"><i class="fa-solid fa-id-card fa-2x mb-3 text-secondary d-block"></i>No driver profiles registered in the system. Click "Add New Driver" to get started.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
