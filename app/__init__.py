@@ -53,7 +53,7 @@ def create_app(config_class=Config):
     migrate.init_app(app, db)
     login_manager.init_app(app)
     login_manager.login_view = 'auth.login'
-    login_manager.login_message = 'Please login to access SafeRide AI.'
+    login_manager.login_message = 'Please login to access safestop.ai.'
     login_manager.login_message_category = 'warning'
 
     init_csrf_protection(app)

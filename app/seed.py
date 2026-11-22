@@ -44,7 +44,7 @@ def seed_database():
         # 1. School Admin User for KBP College Vashi
         admin_user = User(
             institution_id=inst_kbp.id,
-            email='admin@saferide.ai',
+            email='admin@safestop.ai',
             role='ADMIN',
             full_name='Dr. Rajesh Sharma (Director of Transport, KBP College)',
             phone='+91 98200 11223'
@@ -53,34 +53,34 @@ def seed_database():
         db.session.add(admin_user)
 
         # 2. Driver Users
-        driver1_user = User(institution_id=inst_kbp.id, email='driver1@saferide.ai', role='DRIVER', full_name='Ramesh Kumar', phone='+91 98765 43210')
+        driver1_user = User(institution_id=inst_kbp.id, email='driver1@safestop.ai', role='DRIVER', full_name='Ramesh Kumar', phone='+91 98765 43210')
         driver1_user.set_password('driver123')
 
-        driver2_user = User(institution_id=inst_kbp.id, email='driver2@saferide.ai', role='DRIVER', full_name='Suresh Yadav', phone='+91 98765 43211')
+        driver2_user = User(institution_id=inst_kbp.id, email='driver2@safestop.ai', role='DRIVER', full_name='Suresh Yadav', phone='+91 98765 43211')
         driver2_user.set_password('driver123')
 
-        driver3_user = User(institution_id=inst_kbp.id, email='driver3@saferide.ai', role='DRIVER', full_name='Mahesh Patil', phone='+91 98765 43212')
+        driver3_user = User(institution_id=inst_kbp.id, email='driver3@safestop.ai', role='DRIVER', full_name='Mahesh Patil', phone='+91 98765 43212')
         driver3_user.set_password('driver123')
 
         db.session.add_all([driver1_user, driver2_user, driver3_user])
 
         print("Seeding 15 Real Student Parent Users (Navi Mumbai Residential Contacts)...")
         parent_configs = [
-            ('parent1@saferide.ai', 'Dr. Ashok Patil', '+91 98201 55443', 'Flat 402, Shivam Apartments, Sector 17, Vashi, Navi Mumbai 400703', 'Father'),
-            ('parent2@saferide.ai', 'Priya Sharma', '+91 99887 76656', 'B-201, Palm Beach Residency, Sector 19A, Nerul, Navi Mumbai 400706', 'Mother'),
-            ('parent3@saferide.ai', 'Amit Verma', '+91 99887 76657', 'House No. 45, Gulmohar Society, Sector 11, Kopar Khairane, Navi Mumbai 400709', 'Father'),
-            ('parent4@saferide.ai', 'Kavita Gupta', '+91 99887 76658', 'Flat 104, Sai Heritage, Sector 4, CBD Belapur, Navi Mumbai 400614', 'Mother'),
-            ('parent5@saferide.ai', 'Suresh Deshmukh', '+91 98200 12301', 'Flat 301, Sagar Darshan, Sector 21, Nerul, Navi Mumbai 400706', 'Father'),
-            ('parent6@saferide.ai', 'Rajesh Kulkarni', '+91 98200 12302', 'B-504, Sunshine Towers, Sector 1, Juinagar, Navi Mumbai 400705', 'Father'),
-            ('parent7@saferide.ai', 'Milind Shinde', '+91 98200 12303', 'Flat 102, Gokul Heights, Sector 17, Vashi, Navi Mumbai 400703', 'Father'),
-            ('parent8@saferide.ai', 'Sunita More', '+91 98200 12304', 'House 88, Sector 9, Vashi Market, Navi Mumbai 400703', 'Mother'),
-            ('parent9@saferide.ai', 'Nitin Joshi', '+91 98200 12305', 'Flat 202, Moraj Residency, Sector 14, Kopar Khairane, Navi Mumbai 400709', 'Father'),
-            ('parent10@saferide.ai', 'Dipak Bhosale', '+91 98200 12306', 'Flat 601, Sector 3, CBD Belapur, Navi Mumbai 400614', 'Father'),
-            ('parent11@saferide.ai', 'Vilas Pawar', '+91 98200 12307', 'Plot 44, Sector 22, Nerul West, Navi Mumbai 400706', 'Father'),
-            ('parent12@saferide.ai', 'Ramesh Nambiar', '+91 98200 12308', 'Flat 503, Juinagar Heights, Sector 11, Juinagar, Navi Mumbai 400705', 'Father'),
-            ('parent13@saferide.ai', 'Arvind Chavan', '+91 98200 12309', 'Flat 101, Vashi Plaza Complex, Sector 17, Vashi, Navi Mumbai 400703', 'Father'),
-            ('parent14@saferide.ai', 'Sanjay Thorat', '+91 98200 12310', 'B-102, Vegetable Market Road, Sector 9, Vashi, Navi Mumbai 400703', 'Father'),
-            ('parent15@saferide.ai', 'Prakash Kadam', '+91 98200 12311', 'Flat 304, Green Park Society, Sector 15, Kopar Khairane, Navi Mumbai 400709', 'Father'),
+            ('parent1@safestop.ai', 'Dr. Ashok Patil', '+91 98201 55443', 'Flat 402, Shivam Apartments, Sector 17, Vashi, Navi Mumbai 400703', 'Father'),
+            ('parent2@safestop.ai', 'Priya Sharma', '+91 99887 76656', 'B-201, Palm Beach Residency, Sector 19A, Nerul, Navi Mumbai 400706', 'Mother'),
+            ('parent3@safestop.ai', 'Amit Verma', '+91 99887 76657', 'House No. 45, Gulmohar Society, Sector 11, Kopar Khairane, Navi Mumbai 400709', 'Father'),
+            ('parent4@safestop.ai', 'Kavita Gupta', '+91 99887 76658', 'Flat 104, Sai Heritage, Sector 4, CBD Belapur, Navi Mumbai 400614', 'Mother'),
+            ('parent5@safestop.ai', 'Suresh Deshmukh', '+91 98200 12301', 'Flat 301, Sagar Darshan, Sector 21, Nerul, Navi Mumbai 400706', 'Father'),
+            ('parent6@safestop.ai', 'Rajesh Kulkarni', '+91 98200 12302', 'B-504, Sunshine Towers, Sector 1, Juinagar, Navi Mumbai 400705', 'Father'),
+            ('parent7@safestop.ai', 'Milind Shinde', '+91 98200 12303', 'Flat 102, Gokul Heights, Sector 17, Vashi, Navi Mumbai 400703', 'Father'),
+            ('parent8@safestop.ai', 'Sunita More', '+91 98200 12304', 'House 88, Sector 9, Vashi Market, Navi Mumbai 400703', 'Mother'),
+            ('parent9@safestop.ai', 'Nitin Joshi', '+91 98200 12305', 'Flat 202, Moraj Residency, Sector 14, Kopar Khairane, Navi Mumbai 400709', 'Father'),
+            ('parent10@safestop.ai', 'Dipak Bhosale', '+91 98200 12306', 'Flat 601, Sector 3, CBD Belapur, Navi Mumbai 400614', 'Father'),
+            ('parent11@safestop.ai', 'Vilas Pawar', '+91 98200 12307', 'Plot 44, Sector 22, Nerul West, Navi Mumbai 400706', 'Father'),
+            ('parent12@safestop.ai', 'Ramesh Nambiar', '+91 98200 12308', 'Flat 503, Juinagar Heights, Sector 11, Juinagar, Navi Mumbai 400705', 'Father'),
+            ('parent13@safestop.ai', 'Arvind Chavan', '+91 98200 12309', 'Flat 101, Vashi Plaza Complex, Sector 17, Vashi, Navi Mumbai 400703', 'Father'),
+            ('parent14@safestop.ai', 'Sanjay Thorat', '+91 98200 12310', 'B-102, Vegetable Market Road, Sector 9, Vashi, Navi Mumbai 400703', 'Father'),
+            ('parent15@safestop.ai', 'Prakash Kadam', '+91 98200 12311', 'Flat 304, Green Park Society, Sector 15, Kopar Khairane, Navi Mumbai 400709', 'Father'),
         ]
 
         parent_models = []

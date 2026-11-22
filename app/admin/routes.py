@@ -299,7 +299,7 @@ def student_export_csv():
     return Response(
         output.getvalue(),
         mimetype="text/csv",
-        headers={"Content-disposition": "attachment; filename=saferide_student_roster.csv"}
+        headers={"Content-disposition": "attachment; filename=SafeStop_student_roster.csv"}
     )
 
 
