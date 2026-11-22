@@ -53,7 +53,7 @@
                         <td class="text-end">
                             <form action="{{ url_for('admin.driver_delete', driver_id=d.id) }}" method="POST" class="d-inline" onsubmit="return confirm('Are you sure you want to remove driver {{ d.full_name }}?');">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                <button type="submit" class="btn btn-outline-danger btn-sm"><i class="fa-solid fa-trash"></i></button>
+                                <button type="submit" class="btn btn-outline-danger btn-sm" aria-label="Delete Driver"><i class="fa-solid fa-trash"></i></button>
                             </form>
                         </td>
                     </tr>

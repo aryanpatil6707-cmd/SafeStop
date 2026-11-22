@@ -29,7 +29,7 @@
                     <small class="text-info fw-normal" style="font-size: 0.72rem; letter-spacing: 0.5px;">{{ current_user.institution.slug if current_user.is_authenticated and current_user.role != 'SUPER_ADMIN' else 'System' }}</small>
                 </div>
             </a>
-            <button class="navbar-toggler border-0" type="button" data-bs-toggle="collapse" data-bs-target="#navbarMain">
+            <button class="navbar-toggler border-0" type="button" data-bs-toggle="collapse" data-bs-target="#navbarMain" aria-label="Toggle navigation">
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarMain">
@@ -62,7 +62,7 @@
                 <div class="d-flex align-items-center gap-3 mt-3 mt-lg-0">
                     {% if current_user.is_authenticated %}
                         <div class="dropdown">
-                            <button class="btn btn-outline-secondary position-relative rounded-circle p-2" type="button" data-bs-toggle="dropdown">
+                            <button class="btn btn-outline-secondary position-relative rounded-circle p-2" type="button" data-bs-toggle="dropdown" aria-label="Notifications">
                                 <i class="fa-solid fa-bell"></i>
                                 {% if unread_notifications_count > 0 %}
                                     <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger">
@@ -104,7 +104,7 @@
                 {% for category, message in messages %}
                     <div class="alert alert-{{ category }} alert-dismissible fade show glass-card mb-2" role="alert">
                         {{ message }}
-                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="alert"></button>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="alert" aria-label="Close"></button>
                     </div>
                 {% endfor %}
             {% endif %}

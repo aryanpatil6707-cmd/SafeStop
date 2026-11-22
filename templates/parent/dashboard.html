@@ -233,7 +233,7 @@
         <div class="modal-content glass-card text-white border-secondary">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title fw-bold"><i class="fa-solid fa-user-pen text-info me-2"></i> Update Parent Profile</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <form method="POST" action="{{ url_for('parent.update_profile') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -275,7 +275,7 @@
         <div class="modal-content glass-card text-white border-secondary">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title fw-bold"><i class="fa-solid fa-child text-success me-2"></i> Register Child Student Account</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <form method="POST" action="{{ url_for('parent.add_child') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -304,7 +304,7 @@
         <div class="modal-content glass-card text-white border-warning">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title fw-bold text-warning"><i class="fa-solid fa-bed-pulse me-2"></i> Submit Student Absence / Leave Request</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <form method="POST" action="{{ url_for('parent.add_absence_request') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -354,7 +354,7 @@
         <div class="modal-content glass-card text-white border-warning">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title fw-bold text-warning"><i class="fa-solid fa-location-crosshairs me-2"></i> Proximity Alert Preference</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <form method="POST" action="{{ url_for('parent.update_proximity_preferences') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

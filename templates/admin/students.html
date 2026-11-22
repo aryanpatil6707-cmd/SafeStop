@@ -70,7 +70,7 @@
                                 </button>
                                 <form action="{{ url_for('admin.student_delete', student_id=st.id) }}" method="POST" class="d-inline" onsubmit="return confirm('Delete student {{ st.full_name }}?');">
                                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                    <button type="submit" class="btn btn-sm btn-outline-danger"><i class="fa-solid fa-trash"></i></button>
+                                    <button type="submit" class="btn btn-sm btn-outline-danger" aria-label="Delete Student"><i class="fa-solid fa-trash"></i></button>
                                 </form>
                             </div>
                         </td>
@@ -82,7 +82,7 @@
                             <div class="modal-content glass-card text-white border-secondary">
                                 <div class="modal-header border-secondary">
                                     <h5 class="modal-title fw-bold"><i class="fa-solid fa-bus-simple text-warning me-2"></i> Approve Temporary Bus Reassignment</h5>
-                                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                                 </div>
                                 <form method="POST" action="{{ url_for('admin.student_temp_reassign') }}">
                                     <div class="modal-body">
@@ -136,7 +136,7 @@
         <div class="modal-content glass-card text-white border-secondary">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title fw-bold"><i class="fa-solid fa-user-plus text-info me-2"></i> Register New Student</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <form method="POST" action="{{ url_for('admin.student_add') }}" enctype="multipart/form-data">
                 <div class="modal-body">
@@ -227,7 +227,7 @@
         <div class="modal-content glass-card text-white border-secondary">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title fw-bold"><i class="fa-solid fa-file-csv text-info me-2"></i> Batch Import Students via CSV</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <form method="POST" action="{{ url_for('admin.student_import_csv') }}" enctype="multipart/form-data">
                 <div class="modal-body">
@@ -253,7 +253,7 @@
         <div class="modal-content glass-card text-white border-secondary">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title fw-bold"><i class="fa-solid fa-user-shield text-success me-2"></i> Register New Parent Account</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <form method="POST" action="{{ url_for('admin.parent_add') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
