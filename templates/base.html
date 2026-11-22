@@ -59,7 +59,7 @@
                 </ul>
 
                 <!-- Right Side User Menu & Notifications -->
-                <div class="d-flex align-items-center gap-3">
+                <div class="d-flex align-items-center gap-3 mt-3 mt-lg-0">
                     {% if current_user.is_authenticated %}
                         <div class="dropdown">
                             <button class="btn btn-outline-secondary position-relative rounded-circle p-2" type="button" data-bs-toggle="dropdown">
@@ -70,12 +70,12 @@
                                     </span>
                                 {% endif %}
                             </button>
-                            <ul class="dropdown-menu dropdown-menu-end glass-card border-secondary p-2 shadow-lg" style="width: 320px;">
+                            <ul class="dropdown-menu dropdown-menu-end glass-card border-secondary p-2 shadow-lg" style="width: 320px; max-width: 100vw; overflow-wrap: break-word;">
                                 <li class="dropdown-header text-white-50 fw-bold border-bottom border-secondary pb-2">Notifications</li>
                                 {% for n in header_notifications %}
-                                    <li class="py-2 border-bottom border-secondary border-opacity-25">
+                                    <li class="py-2 border-bottom border-secondary border-opacity-25 text-wrap">
                                         <div class="small fw-semibold text-info">{{ n.title }}</div>
-                                        <div class="text-white-50 small">{{ n.message }}</div>
+                                        <div class="text-white-50 small" style="white-space: normal;">{{ n.message }}</div>
                                     </li>
                                 {% else %}
                                     <li class="text-muted small text-center py-2">No new notifications</li>
