@@ -300,3 +300,48 @@ footer {
     background: #cbd5e1;
     border-radius: 4px;
 }
+
+/* Mobile Responsiveness Improvements */
+@media (max-width: 767.98px) {
+    .glass-card {
+        padding: 1rem !important;
+    }
+
+    .navbar-brand-title {
+        font-size: 1.15rem;
+    }
+
+    .btn {
+        padding: 0.5rem 1rem !important;
+        font-size: 0.9rem !important;
+    }
+
+    .btn-lg {
+        padding: 0.75rem 1.25rem !important;
+        font-size: 1rem !important;
+    }
+
+    .kpi-value {
+        font-size: 1.75rem;
+    }
+
+    #map {
+        height: 350px;
+    }
+
+    /* Improve table scrolling on tiny screens */
+    .table-responsive {
+        margin-bottom: 1rem;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-md);
+    }
+
+    .table-responsive .table {
+        margin-bottom: 0;
+    }
+
+    /* Make flex rows stack better */
+    .d-flex.flex-wrap {
+        gap: 0.5rem !important;
+    }
+}
