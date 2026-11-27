@@ -1105,3 +1105,193 @@ def test_sos_batch_limits_partial_sync_and_dashboard_controls(phase1b_app):
     assert 'isSosSyncInProgress' in html
     assert 'MAX_LOCAL_SOS_QUEUE_SIZE' in html
     assert 'dismissRejectedSos' in html
+
+
+def test_drop_attendance_integrity_error_race_handling(phase1b_app):
+    client = phase1b_app["client"]
+    app = phase1b_app["app"]
+    _login_as(client, phase1b_app["driver_a_u_id"])
+
+    with app.app_context():
+        trip_a2 = Trip(
+            institution_id=phase1b_app["inst_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            route_id=phase1b_app["route_a_id"],
+            driver_id=phase1b_app["driver_a_id"],
+            trip_type="AFTERNOON",
+            status="COMPLETED",
+        )
+        student_a3 = Student(
+            institution_id=phase1b_app["inst_a_id"],
+            full_name="Student A3 SameBus",
+            roll_number="P1B-A3",
+            parent_id=phase1b_app["parent_a_id"],
+            assigned_bus_id=phase1b_app["bus_a1_id"],
+            assigned_route_id=phase1b_app["route_a_id"],
+        )
+        db.session.add_all([trip_a2, student_a3])
+        db.session.commit()
+        trip_a2_id = trip_a2.id
+        student_a3_id = student_a3.id
+
+    def _run_raced_drop(event_id, racing_factory):
+        real_commit = db.session.commit
+        commit_attempts = {"count": 0}
+
+        def raced_commit():
+            commit_attempts["count"] += 1
+            if commit_attempts["count"] == 1:
+                # Discard uncommitted pending unit of work, persist real racing DB state (if any),
+                # then attempt the duplicate/conflicting INSERT so SQLite raises IntegrityError.
+                db.session.rollback()
+                if racing_factory is not None:
+                    competing = racing_factory()
+                    if competing is not None:
+                        db.session.add(competing)
+                        real_commit()
+                        db.session.add(Attendance(
+                            student_id=phase1b_app["student_a1_id"],
+                            trip_id=phase1b_app["trip_a_id"],
+                            bus_id=phase1b_app["bus_a1_id"],
+                            client_event_id=event_id,
+                            verification_status="VERIFIED",
+                            scan_type="DROP",
+                            is_dropped_off=True,
+                            verified_by_driver_id=phase1b_app["driver_a_id"],
+                        ))
+                        return real_commit()
+                raise IntegrityError("INSERT attendances", {}, Exception("Simulated integrity failure without matching row"))
+            return real_commit()
+
+        with patch("app.driver.routes.db.session.commit", side_effect=raced_commit):
+            res = client.post("/driver/api/sync-offline-queue", json={
+                "queue": [{
+                    "client_event_id": event_id,
+                    "trip_id": phase1b_app["trip_a_id"],
+                    "image": phase1b_app["b64_a1"],
+                    "scan_action": "DROP",
+                }]
+            })
+        assert commit_attempts["count"] == 1
+        assert res.status_code == 200
+        return res.get_json()
+
+    # 1. Matching student, trip, and DROP scan action -> already_processed
+    d_match = _run_raced_drop(
+        "evt-drop-race-match",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-drop-race-match",
+            verification_status="VERIFIED",
+            scan_type="DROP",
+            is_dropped_off=True,
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert d_match["already_processed_count"] == 1
+    assert d_match["attendance_results"][0]["status"] == "already_processed"
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 2. Same event ID belongs to a different student -> conflict (rejected)
+    d_diff_student = _run_raced_drop(
+        "evt-drop-race-diff-student",
+        lambda: Attendance(
+            student_id=student_a3_id,
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-drop-race-diff-student",
+            verification_status="VERIFIED",
+            scan_type="DROP",
+            is_dropped_off=True,
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert d_diff_student["rejected_count"] == 1
+    assert d_diff_student["already_processed_count"] == 0
+    assert d_diff_student["attendance_results"][0]["status"] == "rejected"
+    assert d_diff_student["attendance_results"][0]["conflict"] is True
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 3a. Same event ID belongs to a different trip -> conflict (rejected)
+    d_diff_trip = _run_raced_drop(
+        "evt-drop-race-diff-trip",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=trip_a2_id,
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-drop-race-diff-trip",
+            verification_status="VERIFIED",
+            scan_type="DROP",
+            is_dropped_off=True,
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert d_diff_trip["rejected_count"] == 1
+    assert d_diff_trip["attendance_results"][0]["status"] == "rejected"
+    assert d_diff_trip["attendance_results"][0]["conflict"] is True
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 3b. Same student and trip, but event ID belongs to a different scan_type (BOARD) -> conflict (rejected)
+    d_diff_action = _run_raced_drop(
+        "evt-drop-race-diff-action",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-drop-race-diff-action",
+            verification_status="VERIFIED",
+            scan_type="BOARD",
+            is_dropped_off=False,
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert d_diff_action["rejected_count"] == 1
+    assert d_diff_action["attendance_results"][0]["status"] == "rejected"
+    assert d_diff_action["attendance_results"][0]["conflict"] is True
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 4a. Student/trip constraint race where competing row has a DIFFERENT client_event_id -> retryable_failure
+    d_no_match_student_trip = _run_raced_drop(
+        "evt-drop-race-no-match",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-other-board-row",
+            verification_status="VERIFIED",
+            scan_type="BOARD",
+            is_dropped_off=False,
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert d_no_match_student_trip["retryable_failure_count"] == 1
+    assert d_no_match_student_trip["already_processed_count"] == 0
+    assert d_no_match_student_trip["attendance_results"][0]["status"] == "retryable_failure"
+
+    with app.app_context():
+        row = Attendance.query.filter_by(student_id=phase1b_app["student_a1_id"], trip_id=phase1b_app["trip_a_id"]).first()
+        assert row is not None and row.is_dropped_off is False
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 4b. IntegrityError with zero matching records in DB -> retryable_failure
+    d_empty = _run_raced_drop("evt-drop-race-empty", None)
+    assert d_empty["retryable_failure_count"] == 1
+    assert d_empty["already_processed_count"] == 0
+    assert d_empty["attendance_results"][0]["status"] == "retryable_failure"
+    with app.app_context():
+        assert Attendance.query.filter_by(client_event_id="evt-drop-race-empty").count() == 0

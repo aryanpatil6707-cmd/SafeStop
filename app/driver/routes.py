@@ -233,6 +233,31 @@ def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, trigge
     return 'accepted', sos_event, 'EMERGENCY SOS ALERT TRANSMITTED TO SCHOOL ADMIN'
 
 
+def _resolve_attendance_event_idempotency(driver_id, trip_id, student, scan_action, client_event_id, already_status, already_message):
+    """Look up an attendance event by (driver_id, client_event_id) and return conflict or already_processed if found."""
+    if not client_event_id:
+        return None
+    existing_by_event = Attendance.query.filter_by(
+        verified_by_driver_id=driver_id,
+        client_event_id=client_event_id
+    ).first()
+    if not existing_by_event:
+        return None
+    if (
+        existing_by_event.trip_id != trip_id
+        or existing_by_event.student_id != student.id
+        or existing_by_event.scan_type != scan_action
+    ):
+        return 'conflict', None, 'Conflict: client_event_id already used for a different attendance scan.'
+    return 'already_processed', {
+        'status': already_status,
+        'student_id': student.id,
+        'student_name': student.full_name,
+        'roll_number': student.roll_number,
+        'message': already_message,
+    }, None
+
+
 def _record_attendance_scan(driver, trip, student, confidence, scan_action, client_event_id=None, note_prefix="AI Face Recognition"):
     """Persist BOARD or DROP attendance with consent, institution, wrong-bus, idempotency, and conflict checks."""
     if student.institution_id != trip.institution_id:
@@ -243,25 +268,17 @@ def _record_attendance_scan(driver, trip, student, confidence, scan_action, clie
         return 'rejected', None, 'Biometric consent is missing or revoked for this student.'
 
     # Idempotency + conflict check by client_event_id
-    if client_event_id:
-        existing_by_event = Attendance.query.filter_by(
-            verified_by_driver_id=driver.id,
-            client_event_id=client_event_id
-        ).first()
-        if existing_by_event:
-            if (
-                existing_by_event.trip_id != trip.id
-                or existing_by_event.student_id != student.id
-                or existing_by_event.scan_type != scan_action
-            ):
-                return 'conflict', None, 'Conflict: client_event_id already used for a different attendance scan.'
-            return 'already_processed', {
-                'status': 'DROP_VERIFIED' if scan_action == 'DROP' else 'ALREADY_BOARDED',
-                'student_id': student.id,
-                'student_name': student.full_name,
-                'roll_number': student.roll_number,
-                'message': f'{student.full_name} scan already processed.',
-            }, None
+    event_result = _resolve_attendance_event_idempotency(
+        driver.id,
+        trip.id,
+        student,
+        scan_action,
+        client_event_id,
+        already_status='DROP_VERIFIED' if scan_action == 'DROP' else 'ALREADY_BOARDED',
+        already_message=f'{student.full_name} scan already processed.',
+    )
+    if event_result:
+        return event_result
 
     is_correct_bus, _, assigned_bus_code = check_bus_assignment(student.id, trip.bus_id)
     if not is_correct_bus:
@@ -342,15 +359,21 @@ def _record_attendance_scan(driver, trip, student, confidence, scan_action, clie
 
         try:
             db.session.commit()
-        except IntegrityError:
+        except IntegrityError as exc:
             db.session.rollback()
-            return 'already_processed', {
-                'status': 'ALREADY_DROPPED',
-                'student_id': student.id,
-                'student_name': student.full_name,
-                'roll_number': student.roll_number,
-                'message': f"{student.full_name} drop-off already recorded on this trip.",
-            }, None
+            logger.warning(f"IntegrityError recording DROP attendance ({type(exc).__name__})")
+            event_result = _resolve_attendance_event_idempotency(
+                driver.id,
+                trip.id,
+                student,
+                scan_action,
+                client_event_id,
+                already_status='ALREADY_DROPPED',
+                already_message=f"{student.full_name} drop-off already recorded on this trip.",
+            )
+            if event_result:
+                return event_result
+            return 'retryable_failure', None, 'Database error recording drop-off attendance.'
         except Exception as exc:
             db.session.rollback()
             logger.error(f"Database failure recording DROP attendance ({type(exc).__name__})")
@@ -399,17 +422,17 @@ def _record_attendance_scan(driver, trip, student, confidence, scan_action, clie
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        if client_event_id:
-            existing_by_event = Attendance.query.filter_by(
-                verified_by_driver_id=driver.id,
-                client_event_id=client_event_id
-            ).first()
-            if existing_by_event and (
-                existing_by_event.trip_id != trip.id
-                or existing_by_event.student_id != student.id
-                or existing_by_event.scan_type != scan_action
-            ):
-                return 'conflict', None, 'Conflict: client_event_id already used for a different attendance scan.'
+        event_result = _resolve_attendance_event_idempotency(
+            driver.id,
+            trip.id,
+            student,
+            scan_action,
+            client_event_id,
+            already_status='ALREADY_BOARDED',
+            already_message=f"{student.full_name} is already verified and recorded on this trip.",
+        )
+        if event_result:
+            return event_result
         return 'already_processed', {
             'status': 'ALREADY_BOARDED',
             'student_id': student.id,
