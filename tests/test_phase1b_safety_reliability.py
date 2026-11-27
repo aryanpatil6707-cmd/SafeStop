@@ -1295,3 +1295,224 @@ def test_drop_attendance_integrity_error_race_handling(phase1b_app):
     assert d_empty["attendance_results"][0]["status"] == "retryable_failure"
     with app.app_context():
         assert Attendance.query.filter_by(client_event_id="evt-drop-race-empty").count() == 0
+
+
+def test_board_attendance_integrity_error_race_handling(phase1b_app):
+    client = phase1b_app["client"]
+    app = phase1b_app["app"]
+    _login_as(client, phase1b_app["driver_a_u_id"])
+
+    with app.app_context():
+        trip_a2 = Trip(
+            institution_id=phase1b_app["inst_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            route_id=phase1b_app["route_a_id"],
+            driver_id=phase1b_app["driver_a_id"],
+            trip_type="AFTERNOON",
+            status="COMPLETED",
+        )
+        student_a3 = Student(
+            institution_id=phase1b_app["inst_a_id"],
+            full_name="Student A3 BoardRace",
+            roll_number="P1B-A3-B",
+            parent_id=phase1b_app["parent_a_id"],
+            assigned_bus_id=phase1b_app["bus_a1_id"],
+            assigned_route_id=phase1b_app["route_a_id"],
+        )
+        db.session.add_all([trip_a2, student_a3])
+        db.session.commit()
+        trip_a2_id = trip_a2.id
+        student_a3_id = student_a3.id
+
+    def _run_raced_board(event_id, racing_factory):
+        real_commit = db.session.commit
+        commit_attempts = {"count": 0}
+
+        def raced_commit():
+            commit_attempts["count"] += 1
+            if commit_attempts["count"] == 1:
+                db.session.rollback()
+                if racing_factory is not None:
+                    competing = racing_factory()
+                    if competing is not None:
+                        db.session.add(competing)
+                        real_commit()
+                        db.session.add(Attendance(
+                            student_id=phase1b_app["student_a1_id"],
+                            trip_id=phase1b_app["trip_a_id"],
+                            bus_id=phase1b_app["bus_a1_id"],
+                            client_event_id=event_id,
+                            verification_status="VERIFIED",
+                            scan_type="BOARD",
+                            verified_by_driver_id=phase1b_app["driver_a_id"],
+                        ))
+                        return real_commit()
+                raise IntegrityError("INSERT attendances", {}, Exception("Unrelated integrity failure"))
+            return real_commit()
+
+        with patch("app.driver.routes.db.session.commit", side_effect=raced_commit):
+            res = client.post("/driver/api/sync-offline-queue", json={
+                "queue": [{
+                    "client_event_id": event_id,
+                    "trip_id": phase1b_app["trip_a_id"],
+                    "image": phase1b_app["b64_a1"],
+                    "scan_action": "BOARD",
+                }]
+            })
+        assert commit_attempts["count"] == 1
+        assert res.status_code == 200
+        return res.get_json()
+
+    # 1. Matching event ID and matching BOARD event -> already_processed
+    b_match = _run_raced_board(
+        "evt-board-race-match",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-board-race-match",
+            verification_status="VERIFIED",
+            scan_type="BOARD",
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert b_match["already_processed_count"] == 1
+    assert b_match["attendance_results"][0]["status"] == "already_processed"
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 2a. Same event ID reused for a different student -> conflict (rejected)
+    b_diff_student = _run_raced_board(
+        "evt-board-race-diff-student",
+        lambda: Attendance(
+            student_id=student_a3_id,
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-board-race-diff-student",
+            verification_status="VERIFIED",
+            scan_type="BOARD",
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert b_diff_student["rejected_count"] == 1
+    assert b_diff_student["attendance_results"][0]["status"] == "rejected"
+    assert b_diff_student["attendance_results"][0]["conflict"] is True
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 2b. Same event ID reused for a different trip -> conflict (rejected)
+    b_diff_trip = _run_raced_board(
+        "evt-board-race-diff-trip",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=trip_a2_id,
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-board-race-diff-trip",
+            verification_status="VERIFIED",
+            scan_type="BOARD",
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert b_diff_trip["rejected_count"] == 1
+    assert b_diff_trip["attendance_results"][0]["status"] == "rejected"
+    assert b_diff_trip["attendance_results"][0]["conflict"] is True
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 2c. Same event ID reused for a different scan_type (DROP) -> conflict (rejected)
+    b_diff_action = _run_raced_board(
+        "evt-board-race-diff-action",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-board-race-diff-action",
+            verification_status="VERIFIED",
+            scan_type="DROP",
+            is_dropped_off=True,
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert b_diff_action["rejected_count"] == 1
+    assert b_diff_action["attendance_results"][0]["status"] == "rejected"
+    assert b_diff_action["attendance_results"][0]["conflict"] is True
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 3. IntegrityError with no matching event ID and no matching student/trip attendance -> retryable_failure
+    b_empty = _run_raced_board("evt-board-race-empty", None)
+    assert b_empty["retryable_failure_count"] == 1
+    assert b_empty["already_processed_count"] == 0
+    assert b_empty["accepted_count"] == 0
+    assert b_empty["attendance_results"][0]["status"] == "retryable_failure"
+    with app.app_context():
+        assert Attendance.query.filter_by(student_id=phase1b_app["student_a1_id"], trip_id=phase1b_app["trip_a_id"]).count() == 0
+
+    # 4a. Concurrent BOARD attendance record for same student and trip (different event ID) -> already_processed
+    b_concurrent_board = _run_raced_board(
+        "evt-board-race-concurrent",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-other-concurrent-board",
+            verification_status="VERIFIED",
+            scan_type="BOARD",
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert b_concurrent_board["already_processed_count"] == 1
+    assert b_concurrent_board["attendance_results"][0]["status"] == "already_processed"
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 4b. Existing (student, trip) row that is NOT a confirmed BOARD (ABSENT status) -> retryable_failure
+    b_absent_row = _run_raced_board(
+        "evt-board-race-absent",
+        lambda: Attendance(
+            student_id=phase1b_app["student_a1_id"],
+            trip_id=phase1b_app["trip_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            client_event_id="evt-other-absent-row",
+            verification_status="ABSENT",
+            scan_type="BOARD",
+            verified_by_driver_id=phase1b_app["driver_a_id"],
+        ),
+    )
+    assert b_absent_row["retryable_failure_count"] == 1
+    assert b_absent_row["already_processed_count"] == 0
+    assert b_absent_row["attendance_results"][0]["status"] == "retryable_failure"
+
+    with app.app_context():
+        Attendance.query.delete()
+        db.session.commit()
+
+    # 5. Unrelated IntegrityError on online /driver/api/verify-face BOARD must fail with 500 retryable_failure, not success
+    commit_calls = {"count": 0}
+
+    def unrelated_integrity_fail():
+        commit_calls["count"] += 1
+        raise IntegrityError("INSERT notifications", {}, Exception("FK constraint failed on unrelated table"))
+
+    with patch("app.driver.routes.db.session.commit", side_effect=unrelated_integrity_fail):
+        res_online = client.post("/driver/api/verify-face", json={
+            "trip_id": phase1b_app["trip_a_id"],
+            "image": phase1b_app["b64_a1"],
+            "scan_action": "BOARD",
+            "client_event_id": "evt-board-online-unrelated-err",
+        })
+    assert commit_calls["count"] == 1
+    assert res_online.status_code == 500
+    assert res_online.get_json()["result"] == "retryable_failure"
+    with app.app_context():
+        assert Attendance.query.filter_by(student_id=phase1b_app["student_a1_id"], trip_id=phase1b_app["trip_a_id"]).count() == 0

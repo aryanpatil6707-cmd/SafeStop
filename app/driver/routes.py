@@ -420,8 +420,9 @@ def _record_attendance_scan(driver, trip, student, confidence, scan_action, clie
 
     try:
         db.session.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.session.rollback()
+        logger.warning(f"IntegrityError recording BOARD attendance ({type(exc).__name__})")
         event_result = _resolve_attendance_event_idempotency(
             driver.id,
             trip.id,
@@ -433,13 +434,23 @@ def _record_attendance_scan(driver, trip, student, confidence, scan_action, clie
         )
         if event_result:
             return event_result
-        return 'already_processed', {
-            'status': 'ALREADY_BOARDED',
-            'student_id': student.id,
-            'student_name': student.full_name,
-            'roll_number': student.roll_number,
-            'message': f"{student.full_name} is already verified and recorded on this trip.",
-        }, None
+        existing_trip_att = Attendance.query.filter_by(
+            student_id=student.id,
+            trip_id=trip.id,
+        ).first()
+        if (
+            existing_trip_att
+            and existing_trip_att.scan_type == 'BOARD'
+            and existing_trip_att.verification_status in ('VERIFIED', 'MANUAL_OVERRIDE')
+        ):
+            return 'already_processed', {
+                'status': 'ALREADY_BOARDED',
+                'student_id': student.id,
+                'student_name': student.full_name,
+                'roll_number': student.roll_number,
+                'message': f"{student.full_name} is already verified and recorded on this trip.",
+            }, None
+        return 'retryable_failure', None, 'Database error recording boarding attendance.'
     except Exception as exc:
         db.session.rollback()
         logger.error(f"Database failure recording BOARD attendance ({type(exc).__name__})")
