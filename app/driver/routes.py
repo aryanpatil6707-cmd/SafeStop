@@ -22,14 +22,20 @@ def _parse_json_payload():
     return data, None
 
 
-def _validate_client_event_id(raw_id):
-    """Validate optional client idempotency identifier."""
+def _validate_client_event_id(raw_id, required=False):
+    """Validate client idempotency identifier."""
     if raw_id is None or raw_id == '':
+        if required:
+            return None, 'client_event_id is required.'
         return None, None
     if not isinstance(raw_id, str):
         return None, 'Invalid client_event_id format.'
     cleaned = raw_id.strip()
-    if not cleaned or len(cleaned) > 100:
+    if not cleaned:
+        if required:
+            return None, 'client_event_id is required.'
+        return None, None
+    if len(cleaned) > 100:
         return None, 'client_event_id must be 1 to 100 characters.'
     return cleaned, None
 
@@ -83,6 +89,11 @@ def _validate_description(raw_desc, default_text):
 
 def _resolve_sos_context(driver, trip_id_raw, allowed_trip_statuses):
     """Resolve and authorize trip, bus, and institution purely from trusted DB relationships."""
+    if not current_user.institution_id or not driver.institution_id:
+        return None, None, None, 'Institution context is missing for driver or user account.', 400
+    if current_user.institution_id != driver.institution_id:
+        return None, None, None, 'Access Denied: User and driver institution mismatch.', 403
+
     trip = None
     if trip_id_raw is not None and trip_id_raw != '':
         if isinstance(trip_id_raw, bool):
@@ -98,31 +109,60 @@ def _resolve_sos_context(driver, trip_id_raw, allowed_trip_statuses):
             return None, None, None, 'Access Denied: Unauthorized trip reference for SOS alert.', 403
         if trip.status not in allowed_trip_statuses:
             return None, None, None, f'Trip status {trip.status} is not valid for this SOS event.', 400
-        if driver.institution_id and trip.institution_id and trip.institution_id != driver.institution_id:
+        if not trip.institution_id:
+            return None, None, None, 'Trip institution context is missing.', 400
+        if trip.institution_id != driver.institution_id or trip.institution_id != current_user.institution_id:
             return None, None, None, 'Access Denied: Trip institution mismatch.', 403
 
-    bus_id = trip.bus_id if trip else driver.assigned_bus_id
-    inst_id = (trip.institution_id if trip else None) or driver.institution_id
+        bus_id = trip.bus_id
+        bus = db.session.get(Bus, bus_id) if bus_id else None
+        if not bus or not bus.institution_id or bus.institution_id != trip.institution_id:
+            return None, None, None, 'Assigned trip bus institution context is missing or mismatched.', 403
 
-    if current_user.institution_id and inst_id and inst_id != current_user.institution_id:
-        return None, None, None, 'Access Denied: Institution mismatch.', 403
-    if not inst_id:
-        return None, None, None, 'Institution context could not be determined for SOS alert.', 400
+        return trip, bus_id, trip.institution_id, None, 200
+
+    # No trip supplied: resolve strictly via verified driver/user and assigned bus
+    bus_id = driver.assigned_bus_id
     if not bus_id:
         return None, None, None, 'No assigned bus found for SOS alert.', 400
+    bus = db.session.get(Bus, bus_id)
+    if not bus:
+        return None, None, None, 'Assigned bus record not found.', 400
+    if not bus.institution_id:
+        return None, None, None, 'Assigned bus institution context is missing.', 400
+    if bus.institution_id != driver.institution_id or bus.institution_id != current_user.institution_id:
+        return None, None, None, 'Access Denied: Assigned bus institution mismatch.', 403
 
-    return trip, bus_id, inst_id, None, 200
+    return None, bus_id, driver.institution_id, None, 200
 
 
-def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, triggered_at_dt, client_event_id, is_offline=False):
-    """Atomically persist an EmergencyEvent, institution-scoped Alert, and admin Notifications with idempotency."""
+def _sos_payload_matches(existing, trip_id, bus_id, inst_id, lat_f, lng_f, desc, triggered_at_dt, has_explicit_ts):
+    """Return True if an existing EmergencyEvent matches the retried SOS payload."""
+    if existing.trip_id != trip_id or existing.bus_id != bus_id or existing.institution_id != inst_id:
+        return False
+    if (existing.description or '') != (desc or ''):
+        return False
+    if (existing.latitude is None) != (lat_f is None) or (existing.longitude is None) != (lng_f is None):
+        return False
+    if lat_f is not None and (abs(existing.latitude - lat_f) > 1e-6 or abs(existing.longitude - lng_f) > 1e-6):
+        return False
+    if has_explicit_ts and existing.triggered_at and abs((existing.triggered_at - triggered_at_dt).total_seconds()) > 1.0:
+        return False
+    return True
+
+
+def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, triggered_at_dt, client_event_id, is_offline=False, has_explicit_ts=False):
+    """Atomically persist an EmergencyEvent, institution-scoped Alert, and admin Notifications with idempotency and conflict detection."""
+    trip_id = trip.id if trip else None
     if client_event_id:
         existing = EmergencyEvent.query.filter_by(
             triggered_by_user_id=current_user.id,
             client_event_id=client_event_id
         ).first()
         if existing:
-            return 'duplicate', existing, 'SOS event already recorded.'
+            if _sos_payload_matches(existing, trip_id, bus_id, inst_id, lat_f, lng_f, desc, triggered_at_dt, has_explicit_ts):
+                return 'duplicate', existing, 'SOS event already recorded.'
+            return 'conflict', existing, 'Conflict: client_event_id already used for a different SOS event.'
 
     bus = db.session.get(Bus, bus_id)
     bus_code = bus.bus_code if bus else (driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A')
@@ -137,7 +177,7 @@ def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, trigge
     sos_event = EmergencyEvent(
         institution_id=inst_id,
         bus_id=bus_id,
-        trip_id=trip.id if trip else None,
+        trip_id=trip_id,
         triggered_by_user_id=current_user.id,
         client_event_id=client_event_id,
         latitude=lat_f,
@@ -150,7 +190,7 @@ def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, trigge
     sos_alert = Alert(
         institution_id=inst_id,
         bus_id=bus_id,
-        trip_id=trip.id if trip else None,
+        trip_id=trip_id,
         alert_type='SOS_EMERGENCY',
         risk_score=50,
         severity='CRITICAL',
@@ -180,7 +220,9 @@ def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, trigge
                 client_event_id=client_event_id
             ).first()
             if existing:
-                return 'duplicate', existing, 'SOS event already recorded.'
+                if _sos_payload_matches(existing, trip_id, bus_id, inst_id, lat_f, lng_f, desc, triggered_at_dt, has_explicit_ts):
+                    return 'duplicate', existing, 'SOS event already recorded.'
+                return 'conflict', existing, 'Conflict: client_event_id already used for a different SOS event.'
         return 'retryable_failure', None, 'Database integrity error recording SOS alert.'
     except Exception as exc:
         db.session.rollback()
@@ -192,7 +234,7 @@ def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, trigge
 
 
 def _record_attendance_scan(driver, trip, student, confidence, scan_action, client_event_id=None, note_prefix="AI Face Recognition"):
-    """Persist BOARD or DROP attendance with consent, institution, wrong-bus, and idempotency checks."""
+    """Persist BOARD or DROP attendance with consent, institution, wrong-bus, idempotency, and conflict checks."""
     if student.institution_id != trip.institution_id:
         return 'rejected', None, 'Student institution mismatch.'
 
@@ -200,13 +242,19 @@ def _record_attendance_scan(driver, trip, student, confidence, scan_action, clie
     if not fp or fp.parental_consent_given is not True or fp.is_archived is True:
         return 'rejected', None, 'Biometric consent is missing or revoked for this student.'
 
-    # Idempotency check by client_event_id
+    # Idempotency + conflict check by client_event_id
     if client_event_id:
         existing_by_event = Attendance.query.filter_by(
             verified_by_driver_id=driver.id,
             client_event_id=client_event_id
         ).first()
         if existing_by_event:
+            if (
+                existing_by_event.trip_id != trip.id
+                or existing_by_event.student_id != student.id
+                or existing_by_event.scan_type != scan_action
+            ):
+                return 'conflict', None, 'Conflict: client_event_id already used for a different attendance scan.'
             return 'already_processed', {
                 'status': 'DROP_VERIFIED' if scan_action == 'DROP' else 'ALREADY_BOARDED',
                 'student_id': student.id,
@@ -351,6 +399,17 @@ def _record_attendance_scan(driver, trip, student, confidence, scan_action, clie
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
+        if client_event_id:
+            existing_by_event = Attendance.query.filter_by(
+                verified_by_driver_id=driver.id,
+                client_event_id=client_event_id
+            ).first()
+            if existing_by_event and (
+                existing_by_event.trip_id != trip.id
+                or existing_by_event.student_id != student.id
+                or existing_by_event.scan_type != scan_action
+            ):
+                return 'conflict', None, 'Conflict: client_event_id already used for a different attendance scan.'
         return 'already_processed', {
             'status': 'ALREADY_BOARDED',
             'student_id': student.id,
@@ -542,14 +601,14 @@ def api_verify_face():
 
 
 def _process_offline_sos_item(driver, sos_item):
-    """Validate and process one offline SOS queue item with per-item idempotency."""
+    """Validate and process one offline SOS queue item with required idempotency and conflict detection."""
     if not isinstance(sos_item, dict):
         return {'id': None, 'type': 'SOS', 'status': 'rejected', 'message': 'Malformed SOS item.'}
 
     raw_id = sos_item.get('client_event_id') if sos_item.get('client_event_id') is not None else sos_item.get('id')
-    client_event_id, cid_err = _validate_client_event_id(raw_id)
+    client_event_id, cid_err = _validate_client_event_id(raw_id, required=True)
     if cid_err:
-        return {'id': str(raw_id), 'type': 'SOS', 'status': 'rejected', 'message': cid_err}
+        return {'id': str(raw_id) if raw_id is not None else None, 'type': 'SOS', 'status': 'rejected', 'message': cid_err}
 
     trip, bus_id, inst_id, ctx_err, _ = _resolve_sos_context(
         driver, sos_item.get('trip_id'), allowed_trip_statuses={'IN_PROGRESS', 'COMPLETED'}
@@ -565,7 +624,9 @@ def _process_offline_sos_item(driver, sos_item):
     if desc_err:
         return {'id': client_event_id, 'type': 'SOS', 'status': 'rejected', 'message': desc_err}
 
-    triggered_at_dt, ts_err = _parse_iso_timestamp(sos_item.get('triggered_at'))
+    raw_ts = sos_item.get('triggered_at')
+    has_explicit_ts = raw_ts is not None and raw_ts != ''
+    triggered_at_dt, ts_err = _parse_iso_timestamp(raw_ts)
     if ts_err:
         return {'id': client_event_id, 'type': 'SOS', 'status': 'rejected', 'message': ts_err}
 
@@ -580,26 +641,31 @@ def _process_offline_sos_item(driver, sos_item):
         triggered_at_dt=triggered_at_dt,
         client_event_id=client_event_id,
         is_offline=True,
+        has_explicit_ts=has_explicit_ts,
     )
-    result_status = 'already_processed' if outcome == 'duplicate' else outcome
-    return {
+    is_conflict = (outcome == 'conflict')
+    result_status = 'already_processed' if outcome == 'duplicate' else ('rejected' if is_conflict else outcome)
+    resp_item = {
         'id': client_event_id,
         'type': 'SOS',
         'status': result_status,
-        'event_id': event_obj.id if event_obj else None,
+        'event_id': None if is_conflict else (event_obj.id if event_obj else None),
         'message': msg,
     }
+    if is_conflict:
+        resp_item['conflict'] = True
+    return resp_item
 
 
 def _process_offline_attendance_item(driver, item):
-    """Validate and process one offline attendance queue item with per-item outcome."""
+    """Validate and process one offline attendance queue item with required idempotency and conflict detection."""
     if not isinstance(item, dict):
         return {'id': None, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Malformed queue item.'}
 
     raw_id = item.get('client_event_id') if item.get('client_event_id') is not None else item.get('id')
-    client_event_id, cid_err = _validate_client_event_id(raw_id)
+    client_event_id, cid_err = _validate_client_event_id(raw_id, required=True)
     if cid_err:
-        return {'id': str(raw_id), 'type': 'ATTENDANCE', 'status': 'rejected', 'message': cid_err}
+        return {'id': str(raw_id) if raw_id is not None else None, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': cid_err}
 
     scan_action = str(item.get('scan_action', 'BOARD')).strip().upper()
     if scan_action not in ('BOARD', 'DROP'):
@@ -635,22 +701,22 @@ def _process_offline_attendance_item(driver, item):
         return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Unauthorized trip ownership.'}
     if trip.status != 'IN_PROGRESS':
         return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': f'Trip status {trip.status} is not valid for attendance sync.'}
-    if not trip.institution_id or (driver.institution_id and trip.institution_id != driver.institution_id) or (current_user.institution_id and trip.institution_id != current_user.institution_id):
-        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Trip institution mismatch.'}
+    if not trip.institution_id or not driver.institution_id or not current_user.institution_id or trip.institution_id != driver.institution_id or trip.institution_id != current_user.institution_id:
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Trip institution context missing or mismatched.'}
 
-    if client_event_id:
-        existing_by_event = Attendance.query.filter_by(
-            verified_by_driver_id=driver.id,
-            client_event_id=client_event_id
-        ).first()
-        if existing_by_event:
-            return {
-                'id': client_event_id,
-                'type': 'ATTENDANCE',
-                'scan_action': scan_action,
-                'status': 'already_processed',
-                'message': 'Attendance scan already processed.',
-            }
+    existing_by_event = Attendance.query.filter_by(
+        verified_by_driver_id=driver.id,
+        client_event_id=client_event_id
+    ).first()
+    if existing_by_event and (existing_by_event.trip_id != trip.id or existing_by_event.scan_type != scan_action):
+        return {
+            'id': client_event_id,
+            'type': 'ATTENDANCE',
+            'scan_action': scan_action,
+            'status': 'rejected',
+            'conflict': True,
+            'message': 'Conflict: client_event_id already used for a different trip or scan action.',
+        }
 
     res = identify_student_from_face(img_b64, active_trip_id=trip.id, institution_id=trip.institution_id)
     if res.get('status') != 'MATCHED':
@@ -663,6 +729,26 @@ def _process_offline_attendance_item(driver, item):
         }
 
     st = res['student']
+    if existing_by_event:
+        if existing_by_event.student_id != st.id:
+            return {
+                'id': client_event_id,
+                'type': 'ATTENDANCE',
+                'scan_action': scan_action,
+                'status': 'rejected',
+                'conflict': True,
+                'message': 'Conflict: client_event_id already used for a different student.',
+            }
+        return {
+            'id': client_event_id,
+            'type': 'ATTENDANCE',
+            'scan_action': scan_action,
+            'status': 'already_processed',
+            'student_id': st.id,
+            'student_name': st.full_name,
+            'message': 'Attendance scan already processed.',
+        }
+
     outcome, payload, err_msg = _record_attendance_scan(
         driver=driver,
         trip=trip,
@@ -672,15 +758,20 @@ def _process_offline_attendance_item(driver, item):
         client_event_id=client_event_id,
         note_prefix="AI Face Scan (Offline Queue Auto-Synced)",
     )
-    return {
+    is_conflict = (outcome == 'conflict')
+    final_status = 'rejected' if is_conflict else outcome
+    resp_item = {
         'id': client_event_id,
         'type': 'ATTENDANCE',
         'scan_action': scan_action,
-        'status': outcome,
+        'status': final_status,
         'student_id': st.id,
         'student_name': st.full_name,
-        'message': (payload or {}).get('message') or err_msg or outcome,
+        'message': (payload or {}).get('message') or err_msg or final_status,
     }
+    if is_conflict:
+        resp_item['conflict'] = True
+    return resp_item
 
 
 @driver_bp.route('/api/sync-offline-queue', methods=['POST'])
@@ -756,21 +847,40 @@ def manual_verify():
 
     student_id = request.form.get('student_id')
     trip_id = request.form.get('trip_id')
-    reason = request.form.get('reason', 'Driver Manual Override')
+    reason = (request.form.get('reason') or '').strip() or 'Driver Manual Override'
 
     student = db.session.get(Student, int(student_id)) if student_id and str(student_id).isdigit() else None
     trip = db.session.get(Trip, int(trip_id)) if trip_id and str(trip_id).isdigit() else None
 
     if not student or not trip:
         flash('Invalid student or trip reference.', 'danger')
-        return redirect(url_for('driver.camera_verify'))
+        return redirect(url_for('driver.dashboard'))
 
     if trip.driver_id != driver.id:
         flash('Unauthorized access: You cannot verify attendance on another driver\'s trip.', 'danger')
         return redirect(url_for('driver.dashboard'))
 
-    if trip.institution_id and student.institution_id and student.institution_id != trip.institution_id:
-        flash('Access Denied: Student does not belong to this trip\'s institution.', 'danger')
+    if trip.status != 'IN_PROGRESS':
+        flash(f'Manual verification denied: Trip is not active (status: {trip.status}).', 'danger')
+        return redirect(url_for('driver.dashboard'))
+
+    if (
+        not current_user.institution_id
+        or not driver.institution_id
+        or not trip.institution_id
+        or not student.institution_id
+        or len({current_user.institution_id, driver.institution_id, trip.institution_id, student.institution_id}) != 1
+    ):
+        flash('Access Denied: Institution context missing or mismatched.', 'danger')
+        return redirect(url_for('driver.camera_verify'))
+
+    if not trip.bus_id:
+        flash('Manual verification denied: Trip has no assigned bus.', 'danger')
+        return redirect(url_for('driver.camera_verify'))
+
+    is_assigned, bus_reason, _ = check_bus_assignment(student.id, trip.bus_id)
+    if not is_assigned:
+        flash(f'Access Denied: {student.full_name} is not assigned to this bus ({bus_reason}).', 'danger')
         return redirect(url_for('driver.camera_verify'))
 
     existing = Attendance.query.filter_by(student_id=student.id, trip_id=trip.id).first()
@@ -787,11 +897,11 @@ def manual_verify():
 
         # AuditLog entry for manual verification override tracking
         audit_log = AuditLog(
-            institution_id=current_user.institution_id,
+            institution_id=trip.institution_id,
             user_id=current_user.id,
             action="MANUAL_VERIFY_OVERRIDE",
             ip_address=request.remote_addr,
-            details=f"Manual verification override performed by Driver {current_user.full_name} for Student {student.full_name} (Trip #{trip.id}, Bus {trip.bus.bus_code}). Reason: {reason}"
+            details=f"Manual verification override performed by Driver {current_user.full_name} for Student {student.full_name} (Trip #{trip.id}, Bus {trip.bus.bus_code if trip.bus else 'N/A'}). Reason: {reason}"
         )
         db.session.add(audit_log)
 
@@ -799,12 +909,19 @@ def manual_verify():
             n = Notification(
                 user_id=student.parent.user.id,
                 title="🚌 Boarding Confirmed (Driver Verification)",
-                message=f"Your child {student.full_name} was manually verified on {trip.bus.bus_code}.",
+                message=f"Your child {student.full_name} was manually verified on {trip.bus.bus_code if trip.bus else 'assigned bus'}.",
                 category="BOARDING"
             )
             db.session.add(n)
 
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            logger.error(f"Database error in manual_verify ({type(exc).__name__})")
+            flash('Database error recording manual verification. Please try again.', 'danger')
+            return redirect(url_for('driver.camera_verify'))
+
         flash(f'Manual verification recorded for {student.full_name}.', 'success')
     else:
         flash(f'{student.full_name} is already marked present.', 'info')
@@ -953,7 +1070,7 @@ def api_trigger_sos():
         return err_resp
 
     raw_id = data.get('client_event_id') if data.get('client_event_id') is not None else data.get('id')
-    client_event_id, cid_err = _validate_client_event_id(raw_id)
+    client_event_id, cid_err = _validate_client_event_id(raw_id, required=True)
     if cid_err:
         return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': cid_err}), 400
 
@@ -971,7 +1088,9 @@ def api_trigger_sos():
     if desc_err:
         return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': desc_err}), 400
 
-    triggered_at_dt, ts_err = _parse_iso_timestamp(data.get('triggered_at'))
+    raw_ts = data.get('triggered_at')
+    has_explicit_ts = raw_ts is not None and raw_ts != ''
+    triggered_at_dt, ts_err = _parse_iso_timestamp(raw_ts)
     if ts_err:
         return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': ts_err}), 400
 
@@ -986,6 +1105,7 @@ def api_trigger_sos():
         triggered_at_dt=triggered_at_dt,
         client_event_id=client_event_id,
         is_offline=False,
+        has_explicit_ts=has_explicit_ts,
     )
 
     if outcome == 'accepted':
@@ -1004,6 +1124,14 @@ def api_trigger_sos():
             'client_event_id': client_event_id,
             'message': msg,
         }), 200
+    if outcome == 'conflict':
+        return jsonify({
+            'status': 'ERROR',
+            'result': 'rejected',
+            'conflict': True,
+            'client_event_id': client_event_id,
+            'message': msg,
+        }), 409
     return jsonify({
         'status': 'ERROR',
         'result': 'retryable_failure',

@@ -2,18 +2,21 @@ import base64
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
 import numpy as np
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app import create_app
 from app.ai.engine import extract_face_features, identify_student_from_face
 from app.models import (
     Alert,
     Attendance,
+    AuditLog,
     Bus,
     Driver,
     EmergencyEvent,
@@ -23,6 +26,7 @@ from app.models import (
     Parent,
     Route,
     Student,
+    TemporaryBusReassignment,
     Trip,
     User,
     db,
@@ -191,6 +195,11 @@ def phase1b_app():
                 "driver_b_u_id": driver_b_u.id,
                 "driver_a_id": driver_a.id,
                 "driver_b_id": driver_b.id,
+                "bus_a1_id": bus_a1.id,
+                "bus_a2_id": bus_a2.id,
+                "bus_b1_id": bus_b1.id,
+                "route_a_id": route_a.id,
+                "parent_a_id": parent_a.id,
                 "parent_a_u_id": parent_a_u.id,
                 "student_a1_id": student_a1.id,
                 "student_a2_id": student_a2_other_bus.id,
@@ -293,12 +302,11 @@ def test_sos_missing_institution_fails_closed(phase1b_app):
     _login_as(client, phase1b_app["driver_a_u_id"])
 
     # Simulate a driver record lacking any institution_id (no trip supplied)
-    from types import SimpleNamespace
     orphan_driver = SimpleNamespace(
         id=phase1b_app["driver_a_id"],
         user_id=phase1b_app["driver_a_u_id"],
         institution_id=None,
-        assigned_bus_id=1,
+        assigned_bus_id=phase1b_app["bus_a1_id"],
         assigned_bus=None,
     )
     with patch("app.driver.routes.Driver") as mock_driver_cls:
@@ -318,12 +326,12 @@ def test_sos_invalid_coordinates_and_timestamps_rejected(phase1b_app):
     _login_as(client, phase1b_app["driver_a_u_id"])
 
     bad_payloads = [
-        {"trip_id": phase1b_app["trip_a_id"], "latitude": 95.0, "longitude": 72.0},
-        {"trip_id": phase1b_app["trip_a_id"], "latitude": 19.0, "longitude": -181.0},
-        {"trip_id": phase1b_app["trip_a_id"], "latitude": 19.0},
-        {"trip_id": phase1b_app["trip_a_id"], "latitude": True, "longitude": 72.0},
-        {"trip_id": phase1b_app["trip_a_id"], "latitude": "not-a-num", "longitude": 72.0},
-        {"trip_id": phase1b_app["trip_a_id"], "triggered_at": "invalid-date-string"},
+        {"client_event_id": "coord-1", "trip_id": phase1b_app["trip_a_id"], "latitude": 95.0, "longitude": 72.0},
+        {"client_event_id": "coord-2", "trip_id": phase1b_app["trip_a_id"], "latitude": 19.0, "longitude": -181.0},
+        {"client_event_id": "coord-3", "trip_id": phase1b_app["trip_a_id"], "latitude": 19.0},
+        {"client_event_id": "coord-4", "trip_id": phase1b_app["trip_a_id"], "latitude": True, "longitude": 72.0},
+        {"client_event_id": "coord-5", "trip_id": phase1b_app["trip_a_id"], "latitude": "not-a-num", "longitude": 72.0},
+        {"client_event_id": "coord-6", "trip_id": phase1b_app["trip_a_id"], "triggered_at": "invalid-date-string"},
     ]
     for payload in bad_payloads:
         res = client.post("/driver/api/trigger-sos", json=payload)
@@ -708,3 +716,392 @@ def test_csrf_enforced_on_driver_camera_sync_and_sos_endpoints(phase1b_app):
     )
     assert res_sos_ok.status_code == 200
     assert res_sos_ok.get_json()["result"] == "accepted"
+
+
+# ----------------
+# Phase 1B Correction Round Tests
+# ----------------
+
+def test_required_event_ids_and_conflict_detection(phase1b_app):
+    client = phase1b_app["client"]
+    app = phase1b_app["app"]
+    _login_as(client, phase1b_app["driver_a_u_id"])
+
+    # 1. Missing or blank client_event_id rejected on online SOS
+    for bad_body in (
+        {"trip_id": phase1b_app["trip_a_id"], "description": "No ID"},
+        {"trip_id": phase1b_app["trip_a_id"], "client_event_id": "   "},
+        {"trip_id": phase1b_app["trip_a_id"], "client_event_id": 12345},
+    ):
+        res_bad = client.post("/driver/api/trigger-sos", json=bad_body)
+        assert res_bad.status_code == 400
+        assert res_bad.get_json()["result"] == "rejected"
+
+    # 2. Missing client_event_id rejected on offline SOS & offline attendance queues
+    res_sync_missing = client.post("/driver/api/sync-offline-queue", json={
+        "queue": [{"trip_id": phase1b_app["trip_a_id"], "image": phase1b_app["b64_a1"], "scan_action": "BOARD"}],
+        "sos_queue": [{"trip_id": phase1b_app["trip_a_id"], "description": "Offline missing ID"}],
+    })
+    assert res_sync_missing.status_code == 200
+    d_miss = res_sync_missing.get_json()
+    assert d_miss["rejected_count"] == 2
+    assert d_miss["attendance_results"][0]["status"] == "rejected"
+    assert d_miss["sos_results"][0]["status"] == "rejected"
+
+    # 3. Online SOS conflict when same client_event_id reused with different payload/trip
+    res_ok = client.post("/driver/api/trigger-sos", json={
+        "client_event_id": "evt-conflict-sos-1",
+        "trip_id": phase1b_app["trip_a_id"],
+        "latitude": 19.01,
+        "longitude": 72.91,
+        "description": "Original SOS",
+    })
+    assert res_ok.status_code == 200
+    assert res_ok.get_json()["result"] == "accepted"
+
+    res_conflict_desc = client.post("/driver/api/trigger-sos", json={
+        "client_event_id": "evt-conflict-sos-1",
+        "trip_id": phase1b_app["trip_a_id"],
+        "latitude": 19.01,
+        "longitude": 72.91,
+        "description": "Different SOS payload",
+    })
+    assert res_conflict_desc.status_code == 409
+    assert res_conflict_desc.get_json()["result"] == "rejected"
+    assert res_conflict_desc.get_json()["conflict"] is True
+
+    res_conflict_no_trip = client.post("/driver/api/trigger-sos", json={
+        "client_event_id": "evt-conflict-sos-1",
+        "description": "Original SOS",
+    })
+    assert res_conflict_no_trip.status_code == 409
+    assert res_conflict_no_trip.get_json()["conflict"] is True
+
+    # 4. Offline SOS conflict on reused client_event_id with different description
+    res_off_conflict = client.post("/driver/api/sync-offline-queue", json={
+        "sos_queue": [{
+            "client_event_id": "evt-conflict-sos-1",
+            "trip_id": phase1b_app["trip_a_id"],
+            "description": "Altered offline SOS",
+        }]
+    })
+    assert res_off_conflict.status_code == 200
+    assert res_off_conflict.get_json()["sos_results"][0]["status"] == "rejected"
+    assert res_off_conflict.get_json()["sos_results"][0]["conflict"] is True
+
+    # 5. Offline attendance conflict when same ID reused for different scan_action or student
+    res_att_ok = client.post("/driver/api/sync-offline-queue", json={
+        "queue": [{
+            "id": "evt-att-conflict-1",
+            "trip_id": phase1b_app["trip_a_id"],
+            "image": phase1b_app["b64_a1"],
+            "scan_action": "BOARD",
+        }]
+    })
+    assert res_att_ok.get_json()["attendance_results"][0]["status"] == "accepted"
+
+    res_att_conflict_action = client.post("/driver/api/sync-offline-queue", json={
+        "queue": [{
+            "id": "evt-att-conflict-1",
+            "trip_id": phase1b_app["trip_a_id"],
+            "image": phase1b_app["b64_a1"],
+            "scan_action": "DROP",
+        }]
+    })
+    assert res_att_conflict_action.get_json()["attendance_results"][0]["status"] == "rejected"
+    assert res_att_conflict_action.get_json()["attendance_results"][0]["conflict"] is True
+
+    # 6. Duplicate-key IntegrityError race resolves cleanly to duplicate on matching payload
+    real_commit = db.session.commit
+    with patch("app.driver.routes.db.session.commit", side_effect=[IntegrityError("stmt", "params", "orig"), real_commit]):
+        res_race = client.post("/driver/api/trigger-sos", json={
+            "client_event_id": "evt-conflict-sos-1",
+            "trip_id": phase1b_app["trip_a_id"],
+            "latitude": 19.01,
+            "longitude": 72.91,
+            "description": "Original SOS",
+        })
+    assert res_race.status_code == 200
+    assert res_race.get_json()["result"] == "duplicate"
+
+
+def test_sos_strict_institution_consistency_and_completed_offline_trip(phase1b_app):
+    client = phase1b_app["client"]
+    app = phase1b_app["app"]
+    _login_as(client, phase1b_app["driver_a_u_id"])
+
+    # 1. Completed trip offline SOS is preserved and accepted
+    with app.app_context():
+        completed_trip = Trip(
+            institution_id=phase1b_app["inst_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            driver_id=phase1b_app["driver_a_id"],
+            route_id=phase1b_app["route_a_id"],
+            trip_type="MORNING_PICKUP",
+            status="COMPLETED",
+            start_time=datetime.utcnow() - timedelta(hours=1),
+            end_time=datetime.utcnow(),
+        )
+        db.session.add(completed_trip)
+        db.session.commit()
+        completed_trip_id = completed_trip.id
+
+    res_completed = client.post("/driver/api/sync-offline-queue", json={
+        "sos_queue": [{
+            "client_event_id": "sos-completed-trip-1",
+            "trip_id": completed_trip_id,
+            "description": "Delayed sync after trip ended",
+        }]
+    })
+    assert res_completed.status_code == 200
+    assert res_completed.get_json()["sos_results"][0]["status"] == "accepted"
+
+    # 2. Online SOS rejects COMPLETED trip
+    res_online_completed = client.post("/driver/api/trigger-sos", json={
+        "client_event_id": "sos-online-completed",
+        "trip_id": completed_trip_id,
+    })
+    assert res_online_completed.status_code == 400
+    assert res_online_completed.get_json()["result"] == "rejected"
+
+    # 3. User vs driver institution mismatch fails closed
+    with app.app_context():
+        u = db.session.get(User, phase1b_app["driver_a_u_id"])
+        u.institution_id = phase1b_app["inst_b_id"]
+        db.session.commit()
+
+    res_user_mismatch = client.post("/driver/api/trigger-sos", json={
+        "client_event_id": "sos-user-mismatch",
+        "trip_id": phase1b_app["trip_a_id"],
+    })
+    assert res_user_mismatch.status_code == 403
+    assert res_user_mismatch.get_json()["result"] == "rejected"
+
+    # Restore user institution, test assigned bus institution mismatch (when no trip supplied)
+    with app.app_context():
+        u = db.session.get(User, phase1b_app["driver_a_u_id"])
+        u.institution_id = phase1b_app["inst_a_id"]
+        bus_a1 = db.session.get(Bus, phase1b_app["bus_a1_id"])
+        bus_a1.institution_id = phase1b_app["inst_b_id"]
+        db.session.commit()
+
+    res_bus_mismatch = client.post("/driver/api/trigger-sos", json={
+        "client_event_id": "sos-bus-mismatch",
+    })
+    assert res_bus_mismatch.status_code == 403
+    assert res_bus_mismatch.get_json()["result"] == "rejected"
+
+    # Trip institution missing fails closed
+    with app.app_context():
+        bus_a1 = db.session.get(Bus, phase1b_app["bus_a1_id"])
+        bus_a1.institution_id = phase1b_app["inst_a_id"]
+        db.session.commit()
+
+    bad_trip = SimpleNamespace(
+        id=phase1b_app["trip_a_id"],
+        driver_id=phase1b_app["driver_a_id"],
+        bus_id=phase1b_app["bus_a1_id"],
+        status="IN_PROGRESS",
+        institution_id=None,
+    )
+    real_get = db.session.get
+
+    def get_with_null_trip_inst(model, pk):
+        if model is Trip:
+            return bad_trip
+        return real_get(model, pk)
+
+    with patch("app.driver.routes.db.session.get", side_effect=get_with_null_trip_inst):
+        res_trip_no_inst = client.post("/driver/api/trigger-sos", json={
+            "client_event_id": "sos-trip-no-inst",
+            "trip_id": phase1b_app["trip_a_id"],
+        })
+    assert res_trip_no_inst.status_code == 400
+    assert res_trip_no_inst.get_json()["result"] == "rejected"
+
+
+def test_manual_verify_hardening(phase1b_app):
+    client = phase1b_app["client"]
+    app = phase1b_app["app"]
+
+    # 1. Wrong driver cannot manually verify on Driver A's trip
+    _login_as(client, phase1b_app["driver_b_u_id"])
+    res_wrong_drv = client.post("/driver/manual-verify", data={
+        "student_id": phase1b_app["student_a1_id"],
+        "trip_id": phase1b_app["trip_a_id"],
+        "reason": "Wrong driver test",
+    }, follow_redirects=True)
+    assert b"Unauthorized access" in res_wrong_drv.data
+
+    # 2. Switch to Driver A: cross-institution student rejected
+    _login_as(client, phase1b_app["driver_a_u_id"])
+    res_cross = client.post("/driver/manual-verify", data={
+        "student_id": phase1b_app["student_b1_id"],
+        "trip_id": phase1b_app["trip_a_id"],
+        "reason": "Cross inst test",
+    }, follow_redirects=True)
+    assert b"Institution context missing or mismatched" in res_cross.data
+
+    # 3. Student assigned to another bus (Bus A2) rejected without reassignment
+    res_wrong_bus = client.post("/driver/manual-verify", data={
+        "student_id": phase1b_app["student_a2_id"],
+        "trip_id": phase1b_app["trip_a_id"],
+        "reason": "Other bus student",
+    }, follow_redirects=True)
+    assert b"not assigned to this bus" in res_wrong_bus.data
+
+    # 4. Active TemporaryBusReassignment authorizes Student A2 on Bus A1
+    with app.app_context():
+        today_str = date.today().isoformat()
+        reassignment = TemporaryBusReassignment(
+            student_id=phase1b_app["student_a2_id"],
+            original_bus_id=phase1b_app["bus_a2_id"],
+            temporary_bus_id=phase1b_app["bus_a1_id"],
+            start_date=today_str,
+            end_date=today_str,
+            approved_by_user_id=phase1b_app["admin_a_id"],
+            reason="Approved afternoon swap",
+            is_active=True,
+        )
+        db.session.add(reassignment)
+        db.session.commit()
+
+    res_reassigned = client.post("/driver/manual-verify", data={
+        "student_id": phase1b_app["student_a2_id"],
+        "trip_id": phase1b_app["trip_a_id"],
+        "reason": "Reassigned bus override",
+    }, follow_redirects=True)
+    assert b"Manual verification recorded for Student A2 OtherBus" in res_reassigned.data
+
+    # 5. Database commit failure rolls back and does NOT report success
+    with patch("app.driver.routes.db.session.commit", side_effect=RuntimeError("Commit failed")):
+        res_db_err = client.post("/driver/manual-verify", data={
+            "student_id": phase1b_app["student_a1_id"],
+            "trip_id": phase1b_app["trip_a_id"],
+            "reason": "DB fail test",
+        }, follow_redirects=True)
+    assert b"Database error recording manual verification" in res_db_err.data
+    assert b"Manual verification recorded for Student A1" not in res_db_err.data
+
+    with app.app_context():
+        assert Attendance.query.filter_by(student_id=phase1b_app["student_a1_id"], trip_id=phase1b_app["trip_a_id"]).count() == 0
+
+    # 6. Missing institution fails closed
+    with app.app_context():
+        u = db.session.get(User, phase1b_app["driver_a_u_id"])
+        u.institution_id = None
+        db.session.commit()
+    res_no_inst = client.post("/driver/manual-verify", data={
+        "student_id": phase1b_app["student_a1_id"],
+        "trip_id": phase1b_app["trip_a_id"],
+        "reason": "No inst test",
+    }, follow_redirects=True)
+    assert b"Institution context missing or mismatched" in res_no_inst.data
+
+    # 7. Completed trip rejected; valid IN_PROGRESS trip succeeds and creates MANUAL_OVERRIDE + AuditLog
+    with app.app_context():
+        u = db.session.get(User, phase1b_app["driver_a_u_id"])
+        u.institution_id = phase1b_app["inst_a_id"]
+        completed_trip = Trip(
+            institution_id=phase1b_app["inst_a_id"],
+            bus_id=phase1b_app["bus_a1_id"],
+            driver_id=phase1b_app["driver_a_id"],
+            route_id=phase1b_app["route_a_id"],
+            trip_type="MORNING_PICKUP",
+            status="COMPLETED",
+        )
+        db.session.add(completed_trip)
+        db.session.commit()
+        completed_id = completed_trip.id
+
+    res_completed = client.post("/driver/manual-verify", data={
+        "student_id": phase1b_app["student_a1_id"],
+        "trip_id": completed_id,
+        "reason": "Completed trip test",
+    }, follow_redirects=True)
+    assert b"Trip is not active" in res_completed.data
+
+    res_valid = client.post("/driver/manual-verify", data={
+        "student_id": phase1b_app["student_a1_id"],
+        "trip_id": phase1b_app["trip_a_id"],
+        "reason": "Cap worn",
+    }, follow_redirects=True)
+    assert b"Manual verification recorded for Student A1" in res_valid.data
+
+    with app.app_context():
+        att = Attendance.query.filter_by(student_id=phase1b_app["student_a1_id"], trip_id=phase1b_app["trip_a_id"]).first()
+        assert att is not None
+        assert att.verification_status == "MANUAL_OVERRIDE"
+        assert AuditLog.query.filter_by(action="MANUAL_VERIFY_OVERRIDE").count() >= 2
+
+
+def test_sos_batch_limits_partial_sync_and_dashboard_controls(phase1b_app):
+    client = phase1b_app["client"]
+    app = phase1b_app["app"]
+    _login_as(client, phase1b_app["driver_a_u_id"])
+
+    # 1. Server rejects SOS batch exceeding MAX_OFFLINE_QUEUE_ITEMS (5 in fixture)
+    too_many = [
+        {"client_event_id": f"sos-over-{i}", "trip_id": phase1b_app["trip_a_id"], "description": f"SOS {i}"}
+        for i in range(6)
+    ]
+    res_over = client.post("/driver/api/sync-offline-queue", json={"sos_queue": too_many})
+    assert res_over.status_code == 400
+
+    # 2. Partial batch: valid, rejected (bad coords), and retryable DB failure -> exact outcomes
+    real_commit = db.session.commit
+    call_count = {"n": 0}
+
+    def fail_third_commit():
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("Transient DB error")
+        return real_commit()
+
+    with patch("app.driver.routes.db.session.commit", side_effect=fail_third_commit):
+        res_partial = client.post("/driver/api/sync-offline-queue", json={
+            "sos_queue": [
+                {"client_event_id": "sos-batch-1", "trip_id": phase1b_app["trip_a_id"], "description": "Valid SOS 1"},
+                {"client_event_id": "sos-batch-bad", "trip_id": phase1b_app["trip_a_id"], "latitude": 120.0, "longitude": 10.0},
+                {"client_event_id": "sos-batch-retry", "trip_id": phase1b_app["trip_a_id"], "description": "Retry SOS 3"},
+            ]
+        })
+
+    assert res_partial.status_code == 200
+    dp = res_partial.get_json()
+    assert dp["status"] == "PARTIAL"
+    by_id = {r["id"]: r["status"] for r in dp["sos_results"]}
+    assert by_id == {
+        "sos-batch-1": "accepted",
+        "sos-batch-bad": "rejected",
+        "sos-batch-retry": "retryable_failure",
+    }
+
+    # 3. Retrying batch containing accepted + retryable creates no duplicate for sos-batch-1 and accepts sos-batch-retry
+    res_retry = client.post("/driver/api/sync-offline-queue", json={
+        "sos_queue": [
+            {"client_event_id": "sos-batch-1", "trip_id": phase1b_app["trip_a_id"], "description": "Valid SOS 1"},
+            {"client_event_id": "sos-batch-retry", "trip_id": phase1b_app["trip_a_id"], "description": "Retry SOS 3"},
+        ]
+    })
+    assert res_retry.status_code == 200
+    dr = res_retry.get_json()
+    by_id_retry = {r["id"]: r["status"] for r in dr["sos_results"]}
+    assert by_id_retry == {
+        "sos-batch-1": "already_processed",
+        "sos-batch-retry": "accepted",
+    }
+
+    with app.app_context():
+        assert EmergencyEvent.query.filter_by(client_event_id="sos-batch-1").count() == 1
+        assert EmergencyEvent.query.filter_by(client_event_id="sos-batch-retry").count() == 1
+
+    # 4. Dashboard template includes bounded batch config, concurrency guard, and rejected SOS review UI
+    dash = client.get("/driver/dashboard")
+    assert dash.status_code == 200
+    html = dash.get_data(as_text=True)
+    assert 'id="sos-sync-panel"' in html
+    assert 'data-max-batch-size="5"' in html
+    assert 'isSosSyncInProgress' in html
+    assert 'MAX_LOCAL_SOS_QUEUE_SIZE' in html
+    assert 'dismissRejectedSos' in html

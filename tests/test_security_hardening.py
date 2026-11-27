@@ -43,7 +43,7 @@ def sec_app():
             bus.driver_id = driver.id
             driver.assigned_bus_id = bus.id
 
-            student = Student(full_name="Sec Student", roll_number="STU-001", parent_id=parent.id, institution_id=inst.id)
+            student = Student(full_name="Sec Student", roll_number="STU-001", parent_id=parent.id, assigned_bus_id=bus.id, institution_id=inst.id)
             db.session.add(student)
             db.session.flush()
 

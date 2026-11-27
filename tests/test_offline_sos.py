@@ -15,7 +15,7 @@ def sos_client():
             db.drop_all()
             db.create_all()
 
-            u_driver = User(email="driver_sos@test.com", role="DRIVER", full_name="SOS Driver")
+            u_driver = User(institution_id=1, email="driver_sos@test.com", role="DRIVER", full_name="SOS Driver")
             u_driver.set_password("pass123")
             db.session.add(u_driver)
             db.session.commit()
@@ -49,6 +49,7 @@ def test_api_trigger_sos_with_timestamp(sos_client):
 
     past_time_str = "2026-09-13T10:15:30Z"
     payload = {
+        "client_event_id": "test-online-sos-001",
         "trip_id": trip_id,
         "latitude": 19.076,
         "longitude": 72.877,
@@ -84,6 +85,7 @@ def test_sync_offline_sos_queue(sos_client):
         "queue": [],
         "sos_queue": [
             {
+                "client_event_id": "test-offline-sos-001",
                 "trip_id": trip_id,
                 "latitude": 19.080,
                 "longitude": 72.880,

@@ -300,6 +300,7 @@ def test_sos_and_safety_notifications_are_tenant_scoped(phase1a_app):
 
     # Online SOS from Institution A driver
     res_sos = client.post('/driver/api/trigger-sos', json={
+        'client_event_id': 'p1a-online-sos-1',
         'trip_id': trip_a_id,
         'latitude': 19.01,
         'longitude': 72.91,
@@ -311,6 +312,7 @@ def test_sos_and_safety_notifications_are_tenant_scoped(phase1a_app):
     res_offline_sos = client.post('/driver/api/sync-offline-queue', json={
         'queue': [],
         'sos_queue': [{
+            'client_event_id': 'p1a-offline-sos-1',
             'trip_id': trip_a_id,
             'latitude': 19.02,
             'longitude': 72.92,

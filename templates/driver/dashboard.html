@@ -19,6 +19,9 @@
         </div>
     </div>
 
+    <!-- Offline SOS Synchronization Status & Rejected Events Review Panel -->
+    <div id="sos-sync-panel" class="glass-card p-3 mb-4 border-warning d-none" role="status"></div>
+
     <!-- Driver Duty & Mobile Bus Activation Controller Card -->
     <div class="glass-card p-4 mb-4 border-2 {% if driver.is_online %}border-success{% else %}border-secondary{% endif %}" id="online-status-card">
         <div class="d-flex align-items-center justify-content-between flex-wrap gap-3">
@@ -229,7 +232,7 @@
 {% endblock %}
 
 {% block extra_js %}
-<div id="driver-config" data-trip-id="{{ active_trip.id if active_trip else '' }}" data-is-online="{{ 'true' if driver.is_online else 'false' }}"></div>
+<div id="driver-config" data-trip-id="{{ active_trip.id if active_trip else '' }}" data-is-online="{{ 'true' if driver.is_online else 'false' }}" data-max-batch-size="{{ config.get('MAX_OFFLINE_QUEUE_ITEMS', 50) }}" data-sos-expiry-hours="{{ config.get('OFFLINE_QUEUE_EXPIRY_HOURS', 24) }}"></div>
 <script>
 let gpsWatchId = null;
 let wakeLock = null;
@@ -379,6 +382,20 @@ async function toggleDriverOnlineStatus() {
 }
 
 const SOS_QUEUE_KEY = 'safestop_offline_sos_queue';
+const MAX_LOCAL_SOS_QUEUE_SIZE = 100;
+const driverConfigEl = document.getElementById('driver-config');
+const MAX_SOS_SYNC_BATCH_SIZE = Math.max(1, parseInt(driverConfigEl?.dataset.maxBatchSize || '50', 10) || 50);
+const SOS_QUEUE_EXPIRY_HOURS = Math.max(1, parseInt(driverConfigEl?.dataset.sosExpiryHours || '24', 10) || 24);
+let isSosSyncInProgress = false;
+
+function escapeSosHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
 
 function generateSosEventId() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -387,47 +404,253 @@ function generateSosEventId() {
     return `sos-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function queueOfflineSos(sosPayload) {
+function readSosQueue() {
     try {
-        const existing = JSON.parse(localStorage.getItem(SOS_QUEUE_KEY) || '[]');
-        const list = Array.isArray(existing) ? existing : [];
-        list.push(sosPayload);
-        localStorage.setItem(SOS_QUEUE_KEY, JSON.stringify(list));
+        const raw = localStorage.getItem(SOS_QUEUE_KEY);
+        if (!raw) return { items: [], malformed: false };
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+            return { items: [], malformed: true };
+        }
+        const nowMs = Date.now();
+        const expiryMs = SOS_QUEUE_EXPIRY_HOURS * 60 * 60 * 1000;
+        let mutated = false;
+        const normalized = parsed.map(item => {
+            if (!item || typeof item !== 'object') {
+                mutated = true;
+                return {
+                    client_event_id: generateSosEventId(),
+                    description: 'Malformed local SOS record',
+                    triggered_at: new Date().toISOString(),
+                    _syncStatus: 'rejected',
+                    _syncReason: 'Corrupted local SOS record; requires manual review.'
+                };
+            }
+            let updated = item;
+            if (!updated.client_event_id) {
+                mutated = true;
+                updated = { ...updated, client_event_id: updated.id || generateSosEventId() };
+            }
+            if (!updated._syncStatus && updated.triggered_at) {
+                const tsMs = Date.parse(updated.triggered_at);
+                if (!Number.isNaN(tsMs) && (nowMs - tsMs) > expiryMs) {
+                    mutated = true;
+                    updated = {
+                        ...updated,
+                        _syncStatus: 'rejected',
+                        _syncReason: `SOS record exceeded local ${SOS_QUEUE_EXPIRY_HOURS}-hour expiry window before sync.`
+                    };
+                }
+            }
+            return updated;
+        });
+        if (mutated) {
+            localStorage.setItem(SOS_QUEUE_KEY, JSON.stringify(normalized));
+        }
+        return { items: normalized, malformed: false };
     } catch (e) {
-        console.warn("Unable to queue offline SOS:", e);
+        return { items: [], malformed: true };
     }
 }
 
-async function syncOfflineSosQueue() {
-    let items = [];
+function writeSosQueue(items) {
+    if (!items || items.length === 0) {
+        localStorage.removeItem(SOS_QUEUE_KEY);
+    } else {
+        localStorage.setItem(SOS_QUEUE_KEY, JSON.stringify(items));
+    }
+    renderSosSyncStatus();
+}
+
+function queueOfflineSos(sosPayload) {
+    const { items, malformed } = readSosQueue();
+    if (malformed) {
+        showInlineAlert("error", "Local SOS queue storage is corrupted; this SOS could not be safely queued. Contact transport dispatch directly!");
+        renderSosSyncStatus(true);
+        return false;
+    }
+    if (items.length >= MAX_LOCAL_SOS_QUEUE_SIZE) {
+        showInlineAlert(
+            "error",
+            `Offline SOS queue is full (${MAX_LOCAL_SOS_QUEUE_SIZE} records). New SOS could not be queued safely—please contact transport dispatch directly or clear reviewed alerts.`
+        );
+        renderSosSyncStatus(false, true);
+        return false;
+    }
+    items.push({ ...sosPayload, _syncStatus: 'pending', _syncReason: null });
     try {
-        const parsed = JSON.parse(localStorage.getItem(SOS_QUEUE_KEY) || '[]');
-        if (!Array.isArray(parsed) || parsed.length === 0) return;
-        items = parsed;
+        writeSosQueue(items);
+        return true;
     } catch (e) {
+        showInlineAlert("error", "Device storage error prevented saving offline SOS safely. Contact transport dispatch directly!");
+        return false;
+    }
+}
+
+function renderSosSyncStatus(corrupted = false, queueFull = false) {
+    const panel = document.getElementById('sos-sync-panel');
+    if (!panel) return;
+    const { items, malformed } = readSosQueue();
+    if (corrupted || malformed) {
+        panel.className = 'glass-card p-3 mb-4 border-danger text-white';
+        panel.innerHTML = `
+            <div class="fw-bold text-danger mb-1"><i class="fa-solid fa-triangle-exclamation me-1"></i> Offline SOS Queue Warning</div>
+            <div class="small text-white-50">Stored offline SOS data is malformed and could not be parsed automatically. Please verify all recent emergency alerts directly with transport dispatch.</div>
+        `;
+        return;
+    }
+    if (items.length === 0 && !queueFull) {
+        panel.className = 'glass-card p-3 mb-4 border-warning d-none';
+        panel.innerHTML = '';
         return;
     }
 
+    const pendingItems = items.filter(it => it._syncStatus !== 'rejected');
+    const rejectedItems = items.filter(it => it._syncStatus === 'rejected');
+    const hasRejected = rejectedItems.length > 0 || queueFull;
+
+    let html = `
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+            <div class="fw-bold ${hasRejected ? 'text-danger' : 'text-warning'}">
+                <i class="fa-solid fa-triangle-exclamation me-1"></i>
+                Offline SOS Synchronization Status
+            </div>
+            <div class="d-flex gap-2">
+                ${pendingItems.length > 0 ? `<button type="button" class="btn btn-sm btn-outline-warning" onclick="syncOfflineSosQueue()"><i class="fa-solid fa-rotate me-1"></i> Retry Pending (${pendingItems.length})</button>` : ''}
+            </div>
+        </div>
+    `;
+    if (queueFull) {
+        html += `<div class="alert alert-danger py-2 px-3 small mb-2">Local SOS queue limit (${MAX_LOCAL_SOS_QUEUE_SIZE}) reached. Unsynchronized SOS records were preserved; review/dismiss rejected alerts or contact dispatch directly.</div>`;
+    }
+    if (pendingItems.length > 0) {
+        html += `<div class="small text-warning mb-2">${pendingItems.length} offline SOS event(s) waiting for server confirmation (max ${MAX_SOS_SYNC_BATCH_SIZE} per batch).</div>`;
+    }
+    if (rejectedItems.length > 0) {
+        html += `<div class="small text-danger fw-semibold mb-2">${rejectedItems.length} SOS event(s) were REJECTED by the server and were NOT transmitted. Review details below:</div>`;
+        html += `<div class="list-group list-group-flush">`;
+        rejectedItems.forEach(item => {
+            const safeId = escapeSosHtml(item.client_event_id);
+            const safeDesc = escapeSosHtml(item.description || 'Emergency SOS');
+            const safeReason = escapeSosHtml(item._syncReason || 'Rejected by server');
+            const safeTs = escapeSosHtml(item.triggered_at || 'Unknown time');
+            html += `
+                <div class="list-group-item bg-dark text-white border-secondary rounded mb-2 p-2">
+                    <div class="d-flex justify-content-between align-items-start gap-2">
+                        <div class="small">
+                            <div><strong>Event:</strong> ${safeDesc} <span class="text-muted">(${safeTs})</span></div>
+                            <div class="text-danger"><strong>Reason:</strong> ${safeReason}</div>
+                            <div class="text-muted" style="font-size: 0.75rem;">ID: ${safeId}</div>
+                        </div>
+                        <div class="d-flex gap-1 flex-shrink-0">
+                            <button type="button" class="btn btn-xs btn-outline-info btn-sm" onclick="retryRejectedSos('${safeId}')">Retry</button>
+                            <button type="button" class="btn btn-xs btn-outline-secondary btn-sm" onclick="dismissRejectedSos('${safeId}')">Acknowledge</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+        html += `</div>`;
+    }
+
+    panel.className = `glass-card p-3 mb-4 ${hasRejected ? 'border-danger' : 'border-warning'}`;
+    panel.innerHTML = html;
+}
+
+function retryRejectedSos(clientEventId) {
+    const { items } = readSosQueue();
+    const updated = items.map(it =>
+        it.client_event_id === clientEventId
+            ? { ...it, _syncStatus: 'retryable_failure', _syncReason: null }
+            : it
+    );
+    writeSosQueue(updated);
+    syncOfflineSosQueue();
+}
+
+function dismissRejectedSos(clientEventId) {
+    const { items } = readSosQueue();
+    const remaining = items.filter(it => it.client_event_id !== clientEventId);
+    writeSosQueue(remaining);
+}
+
+async function syncOfflineSosQueue() {
+    if (isSosSyncInProgress) return;
+    isSosSyncInProgress = true;
     try {
-        const res = await fetch('/driver/api/sync-offline-queue', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-            body: JSON.stringify({ sos_queue: items })
-        });
-        if (!res.ok) return;
-        const data = await res.json();
-        const resultById = new Map((data.sos_results || []).map(r => [r.id, r]));
-        const remaining = items.filter(item => {
-            const r = resultById.get(item.client_event_id);
-            return !r || (r.status !== 'accepted' && r.status !== 'already_processed' && r.status !== 'rejected');
-        });
-        if (remaining.length === 0) {
-            localStorage.removeItem(SOS_QUEUE_KEY);
-        } else {
-            localStorage.setItem(SOS_QUEUE_KEY, JSON.stringify(remaining));
+        while (true) {
+            const { items, malformed } = readSosQueue();
+            if (malformed) {
+                renderSosSyncStatus(true);
+                return;
+            }
+            const sendable = items.filter(it => !it._syncStatus || it._syncStatus === 'pending' || it._syncStatus === 'retryable_failure');
+            if (sendable.length === 0) {
+                renderSosSyncStatus();
+                return;
+            }
+
+            const batch = sendable.slice(0, MAX_SOS_SYNC_BATCH_SIZE);
+            const cleanBatchPayload = batch.map(({ _syncStatus, _syncReason, ...payloadFields }) => payloadFields);
+
+            const res = await fetch('/driver/api/sync-offline-queue', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                body: JSON.stringify({ sos_queue: cleanBatchPayload })
+            });
+            if (!res.ok) {
+                renderSosSyncStatus();
+                return;
+            }
+
+            const data = await res.json();
+            const resultById = new Map((data.sos_results || []).map(r => [r.id, r]));
+
+            // Re-read current storage to preserve any SOS queued concurrently during fetch
+            const latest = readSosQueue().items;
+            let batchHadProgress = false;
+            const updatedItems = [];
+
+            for (const item of latest) {
+                const r = resultById.get(item.client_event_id);
+                if (!r) {
+                    // Not in current batch or unprocessed: preserve intact
+                    updatedItems.push(item);
+                    continue;
+                }
+                if (r.status === 'accepted' || r.status === 'already_processed') {
+                    batchHadProgress = true;
+                    // Confirmed by server -> safe to remove
+                    continue;
+                }
+                if (r.status === 'rejected') {
+                    batchHadProgress = true;
+                    // Never silently discard rejected SOS: retain with server reason and stop auto-resending
+                    updatedItems.push({
+                        ...item,
+                        _syncStatus: 'rejected',
+                        _syncReason: r.message || 'Rejected by server.'
+                    });
+                    continue;
+                }
+                // retryable_failure: retain for future retry
+                updatedItems.push({
+                    ...item,
+                    _syncStatus: 'retryable_failure',
+                    _syncReason: r.message || 'Temporary server failure.'
+                });
+            }
+
+            writeSosQueue(updatedItems);
+            if (!batchHadProgress || sendable.length <= MAX_SOS_SYNC_BATCH_SIZE) {
+                return;
+            }
         }
     } catch (err) {
         console.warn("Offline SOS sync deferred:", err);
+        renderSosSyncStatus();
+    } finally {
+        isSosSyncInProgress = false;
     }
 }
 
@@ -435,6 +658,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (isDriverOnline) {
         startMobileGpsTracking();
     }
+    renderSosSyncStatus();
     window.addEventListener('online', syncOfflineSosQueue);
     syncOfflineSosQueue();
 });
@@ -451,14 +675,18 @@ async function dispatchSosPayload(payload) {
             showInlineAlert("success", "🚨 EMERGENCY SOS CONFIRMED BY SERVER!");
             setTimeout(() => window.location.reload(), 2500);
         } else if (res.status >= 500 || data.result === 'retryable_failure') {
-            queueOfflineSos(payload);
-            showInlineAlert("error", (data.message || "Server error.") + " SOS queued for automatic retry.");
+            const queued = queueOfflineSos(payload);
+            if (queued) {
+                showInlineAlert("error", (data.message || "Server error.") + " SOS queued for automatic retry.");
+            }
         } else {
-            showInlineAlert("error", data.message || "SOS rejected by server.");
+            showInlineAlert("error", "SOS NOT TRANSMITTED (Rejected): " + (data.message || "SOS rejected by server."));
         }
     } catch (err) {
-        queueOfflineSos(payload);
-        showInlineAlert("error", "Network unreachable. SOS queued locally for automatic retry when online.");
+        const queued = queueOfflineSos(payload);
+        if (queued) {
+            showInlineAlert("error", "Network unreachable. SOS queued locally for automatic retry when online.");
+        }
     }
 }
 
