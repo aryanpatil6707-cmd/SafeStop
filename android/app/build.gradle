@@ -14,11 +14,24 @@ android {
         versionCode 1
         versionName "1.0.0"
 
+        buildConfigField "String", "PRODUCTION_SERVER_URL", "\"https://safestop.onrender.com\""
+        manifestPlaceholders = [usesCleartextTraffic: "false"]
+
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
     buildTypes {
+        debug {
+            buildConfigField "boolean", "ALLOW_DEV_SERVER_URL", "true"
+            manifestPlaceholders = [usesCleartextTraffic: "true"]
+        }
         release {
+            buildConfigField "boolean", "ALLOW_DEV_SERVER_URL", "false"
+            manifestPlaceholders = [usesCleartextTraffic: "false"]
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }

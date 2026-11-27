@@ -1,45 +1,58 @@
-# 📱 SafeRide AI — Android Native APK Project (Android Studio)
+# SafeStop — Android WebView Shell (`ai.safestop.app`)
 
-This directory contains the official **Android Studio Project** for **SafeRide AI**. 
+This directory contains the Android Studio project for the SafeStop WebView application (`ai.safestop.app`).
 
-It packages the entire platform into a native Android APK app (`com.saferide.ai`), featuring native WebRTC camera permission handlers, GPS location tracking, hardware acceleration, and full-screen mobile operation for drivers and parents.
+## Security & Permission Architecture (Phase 2A)
+
+- **Trusted Production Origin:** Defaults to `https://safestop.onrender.com` (`BuildConfig.PRODUCTION_SERVER_URL`).
+- **Debug Local Development Origin:** `SERVER_URL` intent extra permits local HTTP URLs (`http://10.0.2.2`, `http://localhost`, `http://127.0.0.1` on ports `5000`, `5001`, `8000`, `8080`) **only** in `debug` builds (`BuildConfig.DEBUG && BuildConfig.ALLOW_DEV_SERVER_URL`).
+- **Release Builds:** Force `usesCleartextTraffic="false"` and reject all `http://` URLs and untrusted hosts/schemes.
+- **Navigation Isolation:** Only same-origin URLs matching the validated launch origin load inside the authenticated `WebView`. Legitimate external `https://` links open in the external browser; untrusted schemes (`file:`, `content:`, `javascript:`, `data:`) are blocked.
+- **Transport & WebView Hardening:** Disables mixed content (`MIXED_CONTENT_NEVER_ALLOW`), disables file/content access (`allowFileAccess = false`, `allowContentAccess = false`), disables third-party cookies, enables Safe Browsing where supported, cancels SSL certificate errors (`handler?.cancel()`), and defines no custom `JavascriptInterface`.
+- **Scoped Runtime Permissions:**
+  - `CAMERA` is requested and granted only for `PermissionRequest.RESOURCE_VIDEO_CAPTURE` from the trusted SafeStop origin.
+  - `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` are requested and granted only for geolocation prompts from the trusted SafeStop origin (with `retain = false` so live permission revocation is respected).
+  - Unsupported or unrequested WebView resources (microphone, DRM, etc.) are denied.
+  - Background location and native foreground GPS service permissions are intentionally excluded until Phase 2B.
 
 ---
 
-## 🛠️ How to Open & Build in Android Studio
+## Build Instructions
 
-### 1. Open Project in Android Studio
-1. Launch **Android Studio**.
-2. Click **Open** (or `File -> Open`).
-3. Select the `android/` directory inside `SafeStop`:
-   `c:\Users\manth\OneDrive\Desktop\SafeStop\android`
-4. Android Studio will automatically index the project and sync Gradle dependencies.
+Open `android/` in Android Studio or run via Gradle:
 
----
-
-### 2. Configure Backend Server URL
-Open [`android/app/src/main/java/com/saferide/ai/MainActivity.kt`](file:///c:/Users/manth/OneDrive/Desktop/SafeStop/android/app/src/main/java/com/saferide/ai/MainActivity.kt):
-
-```kotlin
-// Change server URL as needed:
-// "http://10.0.2.2:5000" -> Android Emulator loopback to host Flask server
-// "http://192.168.1.100:5000" -> Physical phone connected on same Wi-Fi network
-// "https://your-production-domain.com" -> Production cloud deployment
-private val SERVER_URL = "http://10.0.2.2:5000"
+```bash
+./gradlew assembleDebug
 ```
 
----
-
-### 3. Generate Android APK File
-In Android Studio:
-1. Go to top menu: **Build** ➔ **Build Bundle(s) / APK(s)** ➔ **Build APK(s)**.
-2. Android Studio will compile the Kotlin code and generate:
-   `android/app/build/outputs/apk/debug/app-debug.apk`
-3. Click **locate** in the Android Studio notification popup to copy the APK file to your mobile phone.
+Debug builds write `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 ---
 
-## 🔒 Native Permissions Handled
-- **Camera Access (`android.permission.CAMERA`)**: Automatically granted via `WebChromeClient.onPermissionRequest()` so the driver's phone camera scans student faces inside the native app without browser prompt interruptions.
-- **GPS Location (`android.permission.ACCESS_FINE_LOCATION`)**: Enables real-time bus route deviation tracking and geofencing.
-- **Audio (`android.permission.RECORD_AUDIO`)**: Enables Web Speech API driver voice callouts.
+## Phase 2A Android Manual Verification Checklist
+
+1. **Trusted Production URL (Default / Release & Debug):**
+   - Launch `MainActivity` without `SERVER_URL` extra (or with `SERVER_URL="https://safestop.onrender.com"`).
+   - Verify SafeStop loads over HTTPS and navigation stays inside the WebView.
+2. **Rejection of Untrusted URL (`SERVER_URL` Intent Extra):**
+   - Launch with `adb shell am start -n ai.safestop.app/.MainActivity --es SERVER_URL "https://evil.example.com"` or `--es SERVER_URL "http://192.168.1.50:5000"` or `--es SERVER_URL "javascript:alert(1)"`.
+   - Verify the toast/warning appears, the untrusted URL does not load, and the WebView falls back to `https://safestop.onrender.com`.
+   - In a `release` build, also pass `http://10.0.2.2:5000` and verify it is rejected.
+3. **HTTPS Certificate Failure:**
+   - Connect a debug build or test device to an HTTPS endpoint presenting an invalid/self-signed/mismatched certificate.
+   - Verify `onReceivedSslError` calls `handler?.cancel()`, displays the "Secure Connection Required" alert, and never proceeds or renders the untrusted page.
+4. **Camera Permission Granted & Denied:**
+   - Open Driver Face Verification on the trusted origin.
+   - Grant Camera permission when prompted → verify camera stream initializes cleanly.
+   - Deny Camera once → verify clean user prompt; deny permanently ("Don't ask again") → verify App Settings dialog appears without crashing.
+   - Revoke Camera in Android Settings and re-open Face Verification → verify the WebView does not treat the prior grant as permanent.
+5. **Location Permission Granted & Denied:**
+   - Log in as Driver and click **Go Online & Activate Bus** on the trusted origin.
+   - Grant Location permission → verify geolocation initializes and dashboard telemetry shows `GPS active (syncing while console is open)` after server confirmation.
+   - Deny Location permission → verify driver dashboard displays `GPS permission denied` (never stuck on active).
+6. **External Link Handling:**
+   - Navigate to or tap an external `https://` link whose host differs from the SafeStop origin.
+   - Verify the external URL opens in Android's external browser rather than inside the authenticated SafeStop WebView, and `file://` / `javascript:` links are blocked.
+7. **Release Build Cleartext Traffic Disabled:**
+   - Build or inspect the merged release manifest (`assembleRelease` / `processReleaseMainManifest`).
+   - Confirm `android:usesCleartextTraffic="false"` in the release manifest and `BuildConfig.ALLOW_DEV_SERVER_URL == false`.

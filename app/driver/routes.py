@@ -1046,6 +1046,61 @@ def api_toggle_online():
     })
 
 
+def _resolve_gps_context(driver, trip_id_raw):
+    """Validate driver, institution, trip, and assigned bus authorization for GPS updates."""
+    if not current_user.institution_id or not driver.institution_id:
+        return None, None, 'Institution context is missing for driver or user account.', 400
+    if current_user.institution_id != driver.institution_id:
+        return None, None, 'Access Denied: User and driver institution mismatch.', 403
+
+    if trip_id_raw is not None and trip_id_raw != '':
+        if isinstance(trip_id_raw, (bool, float)):
+            return None, None, 'Invalid trip_id.', 400
+        try:
+            trip_id_int = int(str(trip_id_raw).strip()) if isinstance(trip_id_raw, str) else int(trip_id_raw)
+        except (ValueError, TypeError):
+            return None, None, 'Invalid trip_id.', 400
+        if trip_id_int <= 0:
+            return None, None, 'Invalid trip_id.', 400
+
+        trip = db.session.get(Trip, trip_id_int)
+        if not trip:
+            return None, None, 'Trip reference not found.', 404
+        if trip.driver_id != driver.id:
+            return None, None, 'Access Denied: Unauthorized trip reference for GPS update.', 403
+        if trip.status != 'IN_PROGRESS':
+            return None, None, f'Trip status {trip.status} is not active for GPS updates.', 400
+        if not trip.institution_id:
+            return None, None, 'Trip institution context is missing.', 400
+        if trip.institution_id != driver.institution_id or trip.institution_id != current_user.institution_id:
+            return None, None, 'Access Denied: Trip institution mismatch.', 403
+
+        if not trip.bus_id:
+            return None, None, 'Trip has no assigned bus.', 400
+        trip_bus = db.session.get(Bus, trip.bus_id)
+        if not trip_bus:
+            return None, None, 'Trip bus record not found.', 404
+        if not trip_bus.institution_id or trip_bus.institution_id != trip.institution_id:
+            return None, None, 'Access Denied: Trip bus institution context missing or mismatched.', 403
+        if not driver.assigned_bus_id or driver.assigned_bus_id != trip.bus_id:
+            return None, None, 'Access Denied: Trip bus does not match driver assigned bus.', 403
+        if trip_bus.driver_id is not None and trip_bus.driver_id != driver.id:
+            return None, None, 'Access Denied: Trip bus is assigned to another driver.', 403
+        return trip, trip_bus, None, 200
+
+    # Idle online tracking (no trip supplied): verify assigned bus if present
+    assigned_bus = None
+    if driver.assigned_bus_id:
+        assigned_bus = db.session.get(Bus, driver.assigned_bus_id)
+        if not assigned_bus:
+            return None, None, 'Assigned bus record not found.', 403
+        if not assigned_bus.institution_id or assigned_bus.institution_id != driver.institution_id:
+            return None, None, 'Access Denied: Assigned bus institution mismatch.', 403
+        if assigned_bus.driver_id is not None and assigned_bus.driver_id != driver.id:
+            return None, None, 'Access Denied: Assigned bus is assigned to another driver.', 403
+    return None, assigned_bus, None, 200
+
+
 @driver_bp.route('/api/gps-update', methods=['POST'])
 @login_required
 @role_required('DRIVER')
@@ -1054,41 +1109,48 @@ def api_gps_update():
     if not driver:
         return jsonify({'status': 'ERROR', 'message': 'Driver profile not found'}), 403
 
-    data = request.get_json() or {}
+    data, err_resp = _parse_json_payload()
+    if err_resp:
+        return err_resp
+
     lat = data.get('latitude')
     lng = data.get('longitude')
-    trip_id = data.get('trip_id')
-
-    if lat is None or lng is None:
+    if lat is None or lng is None or lat == '' or lng == '':
         return jsonify({'status': 'ERROR', 'message': 'Missing latitude or longitude'}), 400
 
+    lat_f, lng_f, coord_err = _validate_coordinates(lat, lng)
+    if coord_err or lat_f is None or lng_f is None:
+        return jsonify({'status': 'ERROR', 'message': coord_err or 'Invalid latitude or longitude value'}), 400
+
+    trip, target_bus, ctx_err, ctx_status = _resolve_gps_context(driver, data.get('trip_id'))
+    if ctx_err:
+        return jsonify({'status': 'ERROR', 'message': ctx_err}), ctx_status
+
     try:
-        lat_f = float(lat)
-        lng_f = float(lng)
-    except (ValueError, TypeError):
-        return jsonify({'status': 'ERROR', 'message': 'Invalid latitude or longitude value'}), 400
+        update_driver_bus_location(driver, lat_f, lng_f)
+        res = {
+            'status': 'SUCCESS',
+            'lat': lat_f,
+            'lng': lng_f,
+            'driver_is_online': driver.is_online,
+            'bus_code': target_bus.bus_code if target_bus else 'N/A',
+            'bus_status': target_bus.status if target_bus else 'UNASSIGNED',
+        }
 
-    # Always update driver & bus mobile location when GPS coordinates are sent
-    update_driver_bus_location(driver, lat_f, lng_f)
-    driver.is_online = True  # Streaming GPS implicitly confirms driver online state
-
-    res = {
-        'status': 'SUCCESS',
-        'lat': lat_f,
-        'lng': lng_f,
-        'driver_is_online': driver.is_online,
-        'bus_code': driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A',
-        'bus_status': driver.assigned_bus.status if driver.assigned_bus else 'UNASSIGNED'
-    }
-
-    if trip_id:
-        trip = Trip.query.get(trip_id)
-        if trip and trip.driver_id == driver.id and trip.status == 'IN_PROGRESS':
-            trip_res = process_gps_update(trip_id, lat_f, lng_f)
+        if trip is not None:
+            trip_res = process_gps_update(trip.id, lat_f, lng_f)
+            if trip_res.get('status') != 'SUCCESS':
+                db.session.rollback()
+                return jsonify({'status': 'ERROR', 'message': trip_res.get('message', 'Trip GPS update failed')}), 400
             res.update(trip_res)
+        else:
+            db.session.commit()
 
-    db.session.commit()
-    return jsonify(res)
+        return jsonify(res), 200
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(f"Database failure updating GPS location ({type(exc).__name__})")
+        return jsonify({'status': 'ERROR', 'message': 'Database error updating GPS location.'}), 500
 
 
 @driver_bp.route('/api/trigger-sos', methods=['POST'])

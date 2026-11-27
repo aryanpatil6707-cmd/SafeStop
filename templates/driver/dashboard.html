@@ -40,9 +40,9 @@
                 </div>
                 <h5 class="fw-bold text-white mb-1">Bus Duty & Location Controller</h5>
                 <p class="text-muted small mb-0">
-                    When Online, your smartphone streams live GPS coordinates as <b>{{ bus.bus_code if bus else 'Assigned Bus' }}</b> location for Parents & Admin.
-                    <span id="gps-live-feedback" class="ms-2 fw-semibold {% if driver.is_online %}text-success{% else %}text-muted{% endif %}">
-                        {% if driver.is_online %}<i class="fa-solid fa-satellite-dish me-1"></i> Mobile GPS Streaming Active{% else %}<i class="fa-solid fa-location-crosshairs me-1"></i> GPS Standby (Driver Offline){% endif %}
+                    When Online, your smartphone streams live GPS coordinates while this console stays open in the foreground as <b>{{ bus.bus_code if bus else 'Assigned Bus' }}</b> location for Parents & Admin.
+                    <span id="gps-live-feedback" class="ms-2 fw-semibold {% if driver.is_online %}text-warning{% else %}text-muted{% endif %}">
+                        {% if driver.is_online %}<i class="fa-solid fa-spinner fa-spin me-1"></i> Acquiring GPS signal...{% else %}<i class="fa-solid fa-location-crosshairs me-1"></i> GPS stopped (Driver Offline){% endif %}
                     </span>
                 </p>
             </div>
@@ -67,7 +67,7 @@
                 <i class="fa-solid fa-location-dot text-danger me-1"></i> Mobile Lat/Lng: <b class="text-white" id="telemetry-coords">-- , --</b>
             </div>
             <div class="col-6 col-md-3 text-muted">
-                <i class="fa-solid fa-clock text-warning me-1"></i> Last Fix: <b class="text-white" id="telemetry-timestamp">Never</b>
+                <i class="fa-solid fa-clock text-warning me-1"></i> Last Synced: <b class="text-white" id="telemetry-timestamp">Never</b>
             </div>
             <div class="col-6 col-md-3 text-muted">
                 <i class="fa-solid fa-signal text-success me-1"></i> Accuracy: <b class="text-white" id="telemetry-accuracy">Mobile GPS</b>
@@ -236,56 +236,137 @@
 <script>
 let gpsWatchId = null;
 let wakeLock = null;
+let isGpsSyncInProgress = false;
+let pendingLatestGps = null;
+let gpsLifecycleListenersRegistered = false;
 let isDriverOnline = document.getElementById('driver-config')?.dataset.isOnline === 'true';
 const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+
+function setGpsFeedbackState(state, detail = '') {
+    const feedback = document.getElementById('gps-live-feedback');
+    if (!feedback) return;
+    const safeDetail = detail ? ` (${escapeSosHtml(detail)})` : '';
+    switch (state) {
+        case 'acquiring':
+            feedback.innerHTML = '<i class="fa-solid fa-spinner fa-spin me-1 text-warning"></i> <span class="text-warning">Acquiring GPS signal...</span>';
+            break;
+        case 'active':
+            feedback.innerHTML = '<i class="fa-solid fa-satellite-dish me-1 fa-fade text-success"></i> <span class="text-success">GPS active (syncing while console is open)</span>';
+            break;
+        case 'temporarily_unavailable':
+            feedback.innerHTML = `<i class="fa-solid fa-satellite-dish me-1 text-warning"></i> <span class="text-warning">GPS temporarily unavailable${safeDetail}</span>`;
+            break;
+        case 'permission_denied':
+            feedback.innerHTML = `<i class="fa-solid fa-location-crosshairs me-1 text-danger"></i> <span class="text-danger">GPS permission denied${safeDetail}</span>`;
+            break;
+        case 'server_connection_lost':
+            feedback.innerHTML = `<i class="fa-solid fa-triangle-exclamation me-1 text-danger"></i> <span class="text-danger">Server connection lost${safeDetail}</span>`;
+            break;
+        case 'stopped':
+        default:
+            feedback.innerHTML = '<i class="fa-solid fa-location-crosshairs me-1"></i> <span class="text-muted">GPS stopped (Driver Offline)</span>';
+            break;
+    }
+}
 
 // Wake Lock API to prevent screen from sleeping while driving
 async function requestWakeLock() {
     try {
-        if ('wakeLock' in navigator) {
+        if ('wakeLock' in navigator && wakeLock === null) {
             wakeLock = await navigator.wakeLock.request('screen');
             wakeLock.addEventListener('release', () => {
-                console.log('Wake Lock was released');
+                wakeLock = null;
             });
-            console.log('Wake Lock is active');
         }
     } catch (err) {
-        console.error(`${err.name}, ${err.message}`);
+        console.warn('Wake Lock request skipped:', err.message);
     }
 }
 
-function updateLocationOnServer(lat, lng) {
+async function parseJsonResponseSafely(res) {
+    const text = await res.text().catch(() => '');
+    if (!text) return null;
+    try {
+        return JSON.parse(text);
+    } catch (_) {
+        return null;
+    }
+}
+
+function queueGpsLocationUpdate(lat, lng, accuracy = null) {
+    if (!isDriverOnline || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return;
+    }
+    pendingLatestGps = { lat, lng, accuracy };
+    if (!isGpsSyncInProgress) {
+        flushPendingGpsUpdates();
+    }
+}
+
+async function flushPendingGpsUpdates() {
+    if (isGpsSyncInProgress) return;
+    isGpsSyncInProgress = true;
+    try {
+        while (isDriverOnline && pendingLatestGps !== null) {
+            const nextFix = pendingLatestGps;
+            pendingLatestGps = null;
+            await sendGpsUpdateToServer(nextFix.lat, nextFix.lng, nextFix.accuracy);
+        }
+    } finally {
+        isGpsSyncInProgress = false;
+        if (isDriverOnline && pendingLatestGps !== null) {
+            flushPendingGpsUpdates();
+        }
+    }
+}
+
+async function sendGpsUpdateToServer(lat, lng, accuracy = null) {
     const tripIdAttr = document.getElementById('driver-config')?.dataset.tripId;
     const tripId = tripIdAttr ? parseInt(tripIdAttr, 10) : null;
 
-    const coordsEl = document.getElementById('telemetry-coords');
-    const tsEl = document.getElementById('telemetry-timestamp');
-    if (coordsEl) coordsEl.innerHTML = `<span class="text-success">${lat.toFixed(5)}, ${lng.toFixed(5)}</span>`;
-    if (tsEl) tsEl.innerText = new Date().toLocaleTimeString();
-
-    fetch("{{ url_for('driver.api_gps_update') }}", {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-CSRFToken': csrfToken
-        },
-        body: JSON.stringify({
-            latitude: lat,
-            longitude: lng,
-            trip_id: tripId
-        })
-    }).then(res => res.json()).then(data => {
-        if(data.status === 'SUCCESS') {
-            const feedback = document.getElementById('gps-live-feedback');
-            if(feedback) feedback.innerHTML = '<i class="fa-solid fa-satellite-dish me-1 fa-fade text-success"></i> <span class="text-success">Live GPS Broadcasting Active</span>';
-            const busStatusEl = document.getElementById('telemetry-bus-status');
-            if(busStatusEl && data.bus_status) busStatusEl.innerText = data.bus_status;
+    try {
+        const res = await fetch("{{ url_for('driver.api_gps_update') }}", {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': csrfToken
+            },
+            body: JSON.stringify({
+                latitude: lat,
+                longitude: lng,
+                trip_id: tripId
+            })
+        });
+        const data = await parseJsonResponseSafely(res);
+        if (!res.ok || !data || data.status !== 'SUCCESS') {
+            const errDetail = (data && data.message) ? data.message : `HTTP ${res.status}`;
+            console.warn('GPS server sync rejected:', errDetail);
+            setGpsFeedbackState('server_connection_lost', errDetail);
+            return false;
         }
-    }).catch(err => {
-        console.warn("GPS sync warning:", err);
-        const feedback = document.getElementById('gps-live-feedback');
-        if (feedback) feedback.innerHTML = '<i class="fa-solid fa-triangle-exclamation me-1 text-danger"></i> <span class="text-danger">GPS Connection Lost</span>';
-    });
+
+        if (!isDriverOnline) {
+            setGpsFeedbackState('stopped');
+            return false;
+        }
+
+        const coordsEl = document.getElementById('telemetry-coords');
+        const tsEl = document.getElementById('telemetry-timestamp');
+        const accEl = document.getElementById('telemetry-accuracy');
+        const busStatusEl = document.getElementById('telemetry-bus-status');
+
+        if (coordsEl) coordsEl.innerHTML = `<span class="text-success">${lat.toFixed(5)}, ${lng.toFixed(5)}</span>`;
+        if (tsEl) tsEl.innerText = new Date().toLocaleTimeString();
+        if (accEl && Number.isFinite(accuracy)) accEl.innerText = `±${Math.round(accuracy)}m`;
+        if (busStatusEl && data.bus_status) busStatusEl.innerText = data.bus_status;
+
+        setGpsFeedbackState('active');
+        return true;
+    } catch (err) {
+        console.warn('GPS sync warning:', err);
+        setGpsFeedbackState('server_connection_lost', 'network error');
+        return false;
+    }
 }
 
 function showInlineAlert(type, message) {
@@ -299,60 +380,109 @@ function showInlineAlert(type, message) {
     setTimeout(() => alertDiv.remove(), 5000);
 }
 
+function registerGpsLifecycleListeners() {
+    if (gpsLifecycleListenersRegistered) return;
+    gpsLifecycleListenersRegistered = true;
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && isDriverOnline) {
+            requestWakeLock();
+            if (gpsWatchId === null) {
+                startMobileGpsTracking();
+            }
+        }
+    });
+
+    if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+        try {
+            navigator.permissions.query({ name: 'geolocation' }).then((permStatus) => {
+                permStatus.onchange = () => {
+                    if (permStatus.state === 'denied') {
+                        clearGpsWatcherOnly();
+                        pendingLatestGps = null;
+                        setGpsFeedbackState('permission_denied', 'check app or browser settings');
+                    } else if (permStatus.state === 'granted' && isDriverOnline && gpsWatchId === null) {
+                        startMobileGpsTracking();
+                    }
+                };
+            }).catch(() => {});
+        } catch (_) {}
+    }
+}
+
+function clearGpsWatcherOnly() {
+    if (gpsWatchId !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(gpsWatchId);
+        gpsWatchId = null;
+    }
+}
+
 function startMobileGpsTracking() {
+    registerGpsLifecycleListeners();
+
+    if (!isDriverOnline) {
+        setGpsFeedbackState('stopped');
+        return;
+    }
+
     if (!navigator.geolocation) {
+        setGpsFeedbackState('temporarily_unavailable', 'unsupported device');
         showInlineAlert("error", "Geolocation API is not supported by your browser/device.");
         return;
     }
 
-    // Request screen wake lock
     requestWakeLock();
 
-    // Re-acquire wake lock if page becomes visible again
-    document.addEventListener('visibilitychange', async () => {
-        if (wakeLock !== null && document.visibilityState === 'visible' && isDriverOnline) {
-            await requestWakeLock();
-        }
-    });
+    if (gpsWatchId !== null) {
+        return;
+    }
 
-    const feedback = document.getElementById('gps-live-feedback');
-    if (feedback) feedback.innerHTML = '<i class="fa-solid fa-spinner fa-spin me-1 text-warning"></i> <span class="text-warning">Acquiring GPS Signal...</span>';
-
-    // Use watchPosition instead of intervals for better battery & accuracy
-    if (gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId);
+    setGpsFeedbackState('acquiring');
 
     gpsWatchId = navigator.geolocation.watchPosition(
         (pos) => {
-            updateLocationOnServer(pos.coords.latitude, pos.coords.longitude);
+            if (!isDriverOnline) {
+                stopMobileGpsTracking();
+                return;
+            }
             const accEl = document.getElementById('telemetry-accuracy');
             if (accEl && pos.coords.accuracy) {
                 accEl.innerText = `±${Math.round(pos.coords.accuracy)}m`;
             }
+            queueGpsLocationUpdate(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
         },
         (err) => {
-            console.warn("Mobile GPS stream error:", err.message);
-            if (feedback) feedback.innerHTML = '<i class="fa-solid fa-satellite-dish me-1 text-danger"></i> <span class="text-danger">GPS Signal Lost</span>';
+            console.warn("Mobile GPS stream error:", err.code, err.message);
+            if (err && err.code === 1) {
+                clearGpsWatcherOnly();
+                pendingLatestGps = null;
+                setGpsFeedbackState('permission_denied', 'location access disabled');
+            } else {
+                setGpsFeedbackState('temporarily_unavailable', 'waiting for GPS fix');
+            }
         },
         { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
     );
 }
 
 function stopMobileGpsTracking() {
-    if (gpsWatchId) {
-        navigator.geolocation.clearWatch(gpsWatchId);
-        gpsWatchId = null;
-    }
+    pendingLatestGps = null;
+    clearGpsWatcherOnly();
     if (wakeLock !== null) {
-        wakeLock.release().then(() => { wakeLock = null; });
+        wakeLock.release().then(() => { wakeLock = null; }).catch(() => { wakeLock = null; });
     }
     const coordsEl = document.getElementById('telemetry-coords');
     if (coordsEl) coordsEl.innerText = '-- , --';
-    const feedback = document.getElementById('gps-live-feedback');
-    if (feedback) feedback.innerHTML = '<i class="fa-solid fa-location-crosshairs me-1"></i> GPS Standby (Driver Offline)';
+    setGpsFeedbackState('stopped');
 }
 
 async function toggleDriverOnlineStatus() {
     const btn = document.getElementById('btn-toggle-online');
+    const nextOnlineState = !isDriverOnline;
+    if (!nextOnlineState) {
+        isDriverOnline = false;
+        stopMobileGpsTracking();
+    }
     if (btn) {
         btn.disabled = true;
         btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin me-2"></i> Updating Status...';
@@ -365,17 +495,20 @@ async function toggleDriverOnlineStatus() {
                 'Content-Type': 'application/json',
                 'X-CSRFToken': csrfToken
             },
-            body: JSON.stringify({ is_online: !isDriverOnline })
+            body: JSON.stringify({ is_online: nextOnlineState })
         });
-        const data = await res.json();
-        if (data.status === 'SUCCESS') {
-            isDriverOnline = data.is_online;
+        const data = await parseJsonResponseSafely(res);
+        if (res.ok && data && data.status === 'SUCCESS') {
+            isDriverOnline = Boolean(data.is_online);
+            if (!isDriverOnline) {
+                stopMobileGpsTracking();
+            }
             window.location.reload();
         } else {
-            showInlineAlert("error", data.message || "Failed to toggle online status.");
+            showInlineAlert("error", (data && data.message) || `Failed to update online status (HTTP ${res.status}).`);
             setTimeout(() => window.location.reload(), 2000);
         }
-    } catch(e) {
+    } catch (e) {
         showInlineAlert("error", "Network error updating driver online status.");
         setTimeout(() => window.location.reload(), 2000);
     }
