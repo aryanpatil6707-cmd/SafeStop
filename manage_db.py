@@ -20,9 +20,12 @@ def reset_db(app):
         db.create_all()
         print("[OK] Database reset successfully.")
 
-def seed_db():
-    """Populate database with demonstration data."""
-    print("[+] Seeding demonstration dataset...")
+def seed_db(app=None):
+    """Populate database with synthetic demonstration data (development only)."""
+    if app is not None and str(app.config.get('ENV', 'development')).lower() == 'production':
+        print("[X] Security Block: Demonstration data seeding is disabled in production.")
+        sys.exit(1)
+    print("[+] Seeding synthetic development demonstration dataset...")
     seed_database()
 
 def create_institution_and_admin(name, slug, admin_email, admin_password, admin_name, admin_phone="", plan_tier="STARTER"):
@@ -153,7 +156,7 @@ def main():
     elif args.command == "reset":
         reset_db(app)
     elif args.command == "seed":
-        seed_db()
+        seed_db(app)
     elif args.command == "status":
         db_status(app)
     elif args.command == "create-admin":

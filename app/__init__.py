@@ -3,7 +3,8 @@ from flask import Flask, redirect, url_for, flash, jsonify
 from flask_login import LoginManager, current_user
 from flask_migrate import Migrate
 from functools import wraps
-from config import Config
+from werkzeug.middleware.proxy_fix import ProxyFix
+from config import Config, validate_production_config
 from app.models import db, User
 from app.security import init_csrf_protection
 
@@ -42,6 +43,13 @@ def role_required(*roles):
 def create_app(config_class=Config):
     app = Flask(__name__, template_folder='../templates', static_folder='../static')
     app.config.from_object(config_class)
+
+    if str(app.config.get('ENV', 'development')).lower() == 'production':
+        app.debug = False
+        app.config['DEBUG'] = False
+        app.config['TESTING'] = False
+        validate_production_config(app.config)
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
     # Ensure upload directories exist
     os.makedirs(app.config['STUDENT_PHOTOS'], exist_ok=True)
@@ -147,19 +155,6 @@ def create_app(config_class=Config):
     app.register_blueprint(admin_bp, url_prefix='/admin')
     app.register_blueprint(superadmin_bp, url_prefix='/superadmin')
     app.register_blueprint(billing_bp, url_prefix='/billing')
-
-    @app.route('/force-seed-database-secret-url-2026')
-    def force_seed():
-        """A temporary backdoor route to force database initialization since Render Free Tier blocks Shell access."""
-        try:
-            from app.models import db
-            from app.seed import seed_database
-            db.create_all()
-            seed_database()
-            return "SUCCESS! Database tables created and data seeded. You can now login.", 200
-        except Exception as e:
-            import traceback
-            return f"ERROR: {str(e)}\n\n{traceback.format_exc()}", 500
 
     # Root redirect
     @app.route('/')

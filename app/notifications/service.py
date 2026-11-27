@@ -38,24 +38,18 @@ def send_notification(user_id, title, message, category='INFO', action_link=None
     return notif
 
 
-def broadcast_admin_notification(title, message, category='EMERGENCY', institution_id=None):
-    """Broadcast notification to all active school admins (optionally scoped by institution)."""
-    query = User.query.filter_by(role='ADMIN', is_active=True)
-    if institution_id is not None:
-        query = query.filter_by(institution_id=institution_id)
-
-    admins = query.all()
+def _dispatch_group_notifications(users, title, message, category='EMERGENCY'):
+    """Persist in-app notifications and dispatch outbound SMS for a verified list of users."""
     notifs = []
-    
     outbound_categories = getattr(current_app, 'config', {}).get(
-        'OUTBOUND_SMS_CATEGORIES', 
+        'OUTBOUND_SMS_CATEGORIES',
         {'BOARDING', 'ARRIVAL', 'SAFE_DROP', 'EMERGENCY', 'WRONG_BUS'}
     )
     provider = get_notification_provider() if category in outbound_categories else None
 
-    for admin in admins:
+    for user in users:
         n = Notification(
-            user_id=admin.id,
+            user_id=user.id,
             title=title,
             message=message,
             category=category
@@ -63,14 +57,34 @@ def broadcast_admin_notification(title, message, category='EMERGENCY', instituti
         db.session.add(n)
         notifs.append(n)
 
-        if provider and admin.has_valid_phone():
+        if provider and user.has_valid_phone():
             try:
-                provider.send_sms(admin.phone, f"{title}: {message}")
+                provider.send_sms(user.phone, f"{title}: {message}")
             except Exception as e:
-                logger.error(f"Outbound admin notification delivery failed for admin {admin.id}: {e}")
+                logger.error(f"Outbound admin notification delivery failed for user {user.id}: {e}")
 
     db.session.commit()
     return notifs
+
+
+def broadcast_admin_notification(title, message, category='EMERGENCY', institution_id=None):
+    """Broadcast notification strictly to active school admins belonging to the specified institution."""
+    if institution_id is None:
+        logger.warning("Refusing unscoped broadcast_admin_notification without institution_id.")
+        return []
+
+    admins = User.query.filter_by(
+        role='ADMIN',
+        is_active=True,
+        institution_id=institution_id
+    ).all()
+    return _dispatch_group_notifications(admins, title, message, category=category)
+
+
+def broadcast_superadmin_notification(title, message, category='EMERGENCY'):
+    """Explicit platform-wide broadcast targeting Super Admin users only."""
+    superadmins = User.query.filter_by(role='SUPER_ADMIN', is_active=True).all()
+    return _dispatch_group_notifications(superadmins, title, message, category=category)
 
 
 def generate_daily_arrival_digest(parent_id=None):

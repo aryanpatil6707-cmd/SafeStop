@@ -1,6 +1,6 @@
 import pytest  # type: ignore # pyright: ignore[reportMissingImports]
 from app import create_app
-from app.models import db, User, Parent, Notification
+from app.models import db, Institution, User, Parent, Notification
 from app.notifications.service import send_notification, broadcast_admin_notification
 from app.notifications.providers import ConsoleProvider, TwilioProvider
 
@@ -19,25 +19,30 @@ def notif_client():
 
             ConsoleProvider.clear_sent_messages()
 
-            u_parent = User(email="parent_notif@test.com", role="PARENT", full_name="Parent Notif", phone="+91 98200 99999")
+            inst = Institution(name="Notif Test Inst", slug="notif-test-inst")
+            db.session.add(inst)
+            db.session.flush()
+
+            u_parent = User(institution_id=inst.id, email="parent_notif@test.com", role="PARENT", full_name="Parent Notif", phone="+91 98200 99999")
             u_parent.set_password("pass123")
-            u_admin = User(email="admin_notif@test.com", role="ADMIN", full_name="Admin Notif", phone="+91 98200 88888")
+            u_admin = User(institution_id=inst.id, email="admin_notif@test.com", role="ADMIN", full_name="Admin Notif", phone="+91 98200 88888")
             u_admin.set_password("pass123")
             db.session.add_all([u_parent, u_admin])
             db.session.flush()
 
-            p = Parent(user_id=u_parent.id)
+            p = Parent(institution_id=inst.id, user_id=u_parent.id)
             db.session.add(p)
             db.session.commit()
 
             user_id = u_parent.id
             admin_id = u_admin.id
+            inst_id = inst.id
 
-        yield client, user_id, admin_id
+        yield client, user_id, admin_id, inst_id
 
 
 def test_high_priority_notification_triggers_outbound_sms(notif_client):
-    client, parent_user_id, admin_id = notif_client
+    client, parent_user_id, admin_id, _ = notif_client
     ConsoleProvider.clear_sent_messages()
 
     with client.application.app_context():
@@ -63,7 +68,7 @@ def test_high_priority_notification_triggers_outbound_sms(notif_client):
 
 
 def test_low_urgency_category_skips_outbound_sms(notif_client):
-    client, parent_user_id, admin_id = notif_client
+    client, parent_user_id, admin_id, _ = notif_client
     ConsoleProvider.clear_sent_messages()
 
     with client.application.app_context():
@@ -83,15 +88,16 @@ def test_low_urgency_category_skips_outbound_sms(notif_client):
 
 
 def test_broadcast_admin_notification_outbound_sms(notif_client):
-    client, parent_user_id, admin_id = notif_client
+    client, parent_user_id, admin_id, inst_id = notif_client
     ConsoleProvider.clear_sent_messages()
 
     with client.application.app_context():
-        # Triggers EMERGENCY admin broadcast
+        # Triggers EMERGENCY admin broadcast scoped to institution
         notifs = broadcast_admin_notification(
             title="🚨 CRITICAL EMERGENCY",
             message="SOS button pressed by Driver",
-            category="EMERGENCY"
+            category="EMERGENCY",
+            institution_id=inst_id
         )
 
         assert len(notifs) >= 1
@@ -102,7 +108,7 @@ def test_broadcast_admin_notification_outbound_sms(notif_client):
 
 
 def test_provider_failure_graceful_handling(notif_client, monkeypatch):
-    client, parent_user_id, admin_id = notif_client
+    client, parent_user_id, admin_id, _ = notif_client
     ConsoleProvider.clear_sent_messages()
 
     # Mock provider to raise exception

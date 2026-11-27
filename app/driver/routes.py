@@ -359,8 +359,9 @@ def api_sync_offline_queue():
         db.session.add(sos_event)
 
         bus_code = driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A'
+        inst_id = (trip.institution_id if trip else None) or driver.institution_id or current_user.institution_id
         sos_alert = Alert(
-            institution_id=current_user.institution_id,
+            institution_id=inst_id,
             bus_id=bus_id,
             trip_id=trip.id if trip else None,
             alert_type='SOS_EMERGENCY',
@@ -374,7 +375,8 @@ def api_sync_offline_queue():
         broadcast_admin_notification(
             title="🚨 CRITICAL EMERGENCY SOS (Offline Synced)",
             message=f"Offline SOS Alert synced from Driver {current_user.full_name} on Bus {bus_code} (Triggered at {triggered_at_dt.strftime('%H:%M:%S UTC')}).",
-            category="EMERGENCY"
+            category="EMERGENCY",
+            institution_id=inst_id
         )
         sos_synced_count += 1
 
@@ -611,8 +613,9 @@ def api_trigger_sos():
     db.session.add(sos_event)
 
     # Record Alert
+    inst_id = (trip.institution_id if trip else None) or driver.institution_id or current_user.institution_id
     sos_alert = Alert(
-        institution_id=current_user.institution_id,
+        institution_id=inst_id,
         bus_id=bus_id,
         trip_id=trip.id if trip else None,
         alert_type='SOS_EMERGENCY',
@@ -622,12 +625,13 @@ def api_trigger_sos():
     )
     db.session.add(sos_alert)
 
-    # Broadcast to all Admins
+    # Broadcast to institutional Admins only
     from app.notifications.service import broadcast_admin_notification
     broadcast_admin_notification(
         title="🚨 CRITICAL EMERGENCY SOS",
         message=f"SOS Alert received from Driver {current_user.full_name} on Bus {driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A'}.",
-        category="EMERGENCY"
+        category="EMERGENCY",
+        institution_id=inst_id
     )
 
     db.session.commit()
@@ -750,7 +754,8 @@ def check_unscanned_drop_offs(trip, stop_id=None):
                 broadcast_admin_notification(
                     title="🚨 UNSCANNED DROP-OFF ALERT",
                     message=f"Driver on Bus {bus_code} concluded trip without scanning off boarded student {student.full_name} at drop stop {stop_name}.",
-                    category="EMERGENCY"
+                    category="EMERGENCY",
+                    institution_id=trip.institution_id or student.institution_id
                 )
 
     return unscanned_alerts
@@ -863,8 +868,9 @@ def log_telemetry():
         ).first()
 
         if not existing_alert:
+            inst_id = (active_trip.institution_id if active_trip else None) or driver.institution_id or current_user.institution_id
             new_alert = Alert(
-                institution_id=current_user.institution_id,
+                institution_id=inst_id,
                 bus_id=driver.assigned_bus_id,
                 trip_id=active_trip.id if active_trip else None,
                 alert_type=alert_type,
@@ -875,16 +881,14 @@ def log_telemetry():
             db.session.add(new_alert)
             alert_created = True
 
-            # Notify admins
-            admin_users = User.query.filter_by(role='ADMIN').all()
-            for admin_u in admin_users:
-                n = Notification(
-                    user_id=admin_u.id,
-                    title=f"🚨 CRITICAL DRIVER ALERT: {driver.full_name}",
-                    message=desc,
-                    category="EMERGENCY"
-                )
-                db.session.add(n)
+            # Notify institutional admins only
+            from app.notifications.service import broadcast_admin_notification
+            broadcast_admin_notification(
+                title=f"🚨 CRITICAL DRIVER ALERT: {driver.full_name}",
+                message=desc,
+                category="EMERGENCY",
+                institution_id=inst_id
+            )
 
     db.session.commit()
 

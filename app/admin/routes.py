@@ -683,15 +683,15 @@ def driver_add():
     full_name = request.form.get('full_name', '').strip()
     email = request.form.get('email', '').strip()
     phone = request.form.get('phone', '').strip()
-    password = request.form.get('password', 'driver123')
+    password = request.form.get('password', '')
     license_number = request.form.get('license_number', '').strip()
     license_expiry = request.form.get('license_expiry', '')
     assigned_bus_id = request.form.get('assigned_bus_id')
     assigned_route_id = request.form.get('assigned_route_id')
     address = request.form.get('address', '').strip()
 
-    if not full_name or not email or not license_number:
-        flash('Full name, email, and license number are required.', 'warning')
+    if not full_name or not email or not license_number or not password or len(password) < 6:
+        flash('Full name, email, license number, and a password (min 6 chars) are required.', 'warning')
         return redirect(url_for('admin.drivers'))
 
     existing_user = User.query.filter_by(email=email).first()
@@ -742,13 +742,13 @@ def parent_add():
     full_name = request.form.get('full_name', '').strip()
     email = request.form.get('email', '').strip()
     phone = request.form.get('phone', '').strip()
-    password = request.form.get('password', 'parent123')
+    password = request.form.get('password', '')
     address = request.form.get('address', '').strip()
     emergency_contact = request.form.get('emergency_contact', '').strip()
     relationship = request.form.get('relationship', 'Parent')
 
-    if not full_name or not email:
-        flash('Full name and email address are required.', 'warning')
+    if not full_name or not email or not password or len(password) < 6:
+        flash('Full name, email address, and a password (min 6 chars) are required.', 'warning')
         return redirect(url_for('admin.students'))
 
     existing_user = User.query.filter_by(email=email).first()

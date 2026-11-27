@@ -1,8 +1,12 @@
+import logging
 from flask import Blueprint, render_template, redirect, url_for, flash, request
 from flask_login import login_user, logout_user, login_required, current_user
 from app.models import db, User, Parent, Student, AuditLog, Institution
 from app.security import is_safe_url, generate_password_reset_token, verify_password_reset_token
+from app.notifications.email import is_email_configured, send_password_reset_email
 from app.limiter import limiter
+
+logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -152,13 +156,21 @@ def logout():
 def forgot_password():
     if request.method == 'POST':
         email = request.form.get('email', '').strip()
-        user = User.query.filter_by(email=email).first()
-        if user:
+        generic_msg = 'If an account exists with that email, password reset instructions have been sent.'
+
+        if not is_email_configured():
+            # Fail-closed: never display or log reset tokens/URLs when email delivery is unconfigured
+            logger.warning("Password reset requested, but no outbound email provider is configured (fail-closed).")
+            flash(generic_msg, 'info')
+            return redirect(url_for('auth.login'))
+
+        user = User.query.filter_by(email=email).first() if email else None
+        if user and user.is_active:
             token = generate_password_reset_token(user.id)
             reset_url = url_for('auth.reset_password', token=token, _external=True)
-            flash(f'Password reset link generated for {user.email}: {reset_url}', 'success')
-        else:
-            flash('If an account exists with that email, a reset link was sent.', 'info')
+            send_password_reset_email(user.email, reset_url)
+
+        flash(generic_msg, 'info')
         return redirect(url_for('auth.login'))
     return render_template('auth/forgot_password.html')
 
@@ -171,17 +183,32 @@ def reset_password(token):
         flash('The password reset link is invalid or has expired. Please request a new link.', 'danger')
         return redirect(url_for('auth.forgot_password'))
 
-    user = User.query.get_or_404(user_id)
+    user = db.session.get(User, user_id)
+    if not user or not user.is_active:
+        flash('The password reset link is invalid or has expired. Please request a new link.', 'danger')
+        return redirect(url_for('auth.forgot_password'))
 
     if request.method == 'POST':
         password = request.form.get('password', '')
         confirm_password = request.form.get('confirm_password', '')
+
+        if not password or len(password) < 6:
+            flash('Password must be at least 6 characters long.', 'danger')
+            return render_template('auth/reset_password.html')
 
         if password != confirm_password:
             flash('Passwords do not match. Please try again.', 'danger')
             return render_template('auth/reset_password.html')
 
         user.set_password(password)
+        audit_log = AuditLog(
+            institution_id=user.institution_id,
+            user_id=user.id,
+            action='PASSWORD_RESET',
+            ip_address=request.remote_addr,
+            details='Account password reset completed via verified reset token.'
+        )
+        db.session.add(audit_log)
         db.session.commit()
 
         flash('Your password has been reset successfully! Please log in.', 'success')

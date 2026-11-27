@@ -49,9 +49,10 @@ def check_and_escalate_pending_safe_drops():
 
     for drop in pending_drops:
         drop.status = 'ESCALATED'
-        
+        inst_id = (drop.trip.institution_id if drop.trip else None) or (drop.student.institution_id if drop.student else None)
+
         escalated_alert = Alert(
-            institution_id=drop.trip.institution_id if drop.trip else 1,
+            institution_id=inst_id or 1,
             bus_id=drop.trip.bus_id if drop.trip else None,
             trip_id=drop.trip_id,
             student_id=drop.student_id,
@@ -66,7 +67,8 @@ def check_and_escalate_pending_safe_drops():
         broadcast_admin_notification(
             title="⚠️ UNCONFIRMED SAFE DROP ESCALATION",
             message=f"Parent confirmation pending for {drop.student.full_name} (> {escalation_mins} mins).",
-            category="EMERGENCY"
+            category="EMERGENCY",
+            institution_id=inst_id
         )
     
     if pending_drops:
@@ -274,6 +276,7 @@ def process_gps_update(trip_id, lat, lng, speed=25.0, heading=0.0):
 
             if not existing_delay_alert:
                 delay_alert = Alert(
+                    institution_id=trip.institution_id,
                     bus_id=trip.bus_id,
                     trip_id=trip.id,
                     alert_type='BUS_DELAY',

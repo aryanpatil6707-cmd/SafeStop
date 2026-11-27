@@ -29,7 +29,14 @@ def create_checkout_session():
     }
     price_id = price_map.get(target_tier)
 
-    stripe.api_key = current_app.config.get('STRIPE_SECRET_KEY')
+    stripe_api_key = current_app.config.get('STRIPE_SECRET_KEY')
+    if not stripe_api_key or (
+        str(current_app.config.get('ENV', 'development')).lower() == 'production'
+        and str(stripe_api_key).startswith('sk_test_mock_')
+    ):
+        return jsonify({'status': 'ERROR', 'message': 'Stripe billing is not configured.'}), 503
+
+    stripe.api_key = stripe_api_key
 
     inst_id = getattr(current_user, 'institution_id', None)
     
@@ -69,14 +76,23 @@ def create_checkout_session():
 def stripe_webhook():
     """
     Handles Stripe asynchronous webhook events (CSRF exempted).
+    Requires Stripe-Signature verification in all non-testing environments and
+    always rejects unsigned or invalidly signed requests in production.
     """
     payload = request.get_data(as_text=True)
     sig_header = request.headers.get('Stripe-Signature')
     endpoint_secret = current_app.config.get('STRIPE_WEBHOOK_SECRET')
+    env = str(current_app.config.get('ENV', 'development')).lower()
+    is_isolated_testing = bool(current_app.config.get('TESTING')) and env != 'production'
+
+    if env == 'production' and endpoint_secret and str(endpoint_secret).startswith('whsec_mock_'):
+        return jsonify({'status': 'ERROR', 'message': 'Invalid production webhook configuration'}), 500
 
     event = None
 
-    if sig_header and endpoint_secret:
+    if sig_header:
+        if not endpoint_secret:
+            return jsonify({'status': 'ERROR', 'message': 'Webhook secret not configured'}), 500
         try:
             event = stripe.Webhook.construct_event(
                 payload, sig_header, endpoint_secret
@@ -85,12 +101,14 @@ def stripe_webhook():
             return jsonify({'status': 'ERROR', 'message': 'Invalid payload'}), 400
         except stripe.error.SignatureVerificationError:  # type: ignore
             return jsonify({'status': 'ERROR', 'message': 'Invalid signature'}), 400
-    else:
-        # Fallback for testing environments without webhook signing
+    elif is_isolated_testing and current_app.config.get('ALLOW_UNSIGNED_TEST_WEBHOOKS', True):
+        # Explicitly permitted ONLY in isolated non-production test environments
         try:
             event = request.get_json(force=True)
         except Exception:
             return jsonify({'status': 'ERROR', 'message': 'Invalid JSON body'}), 400
+    else:
+        return jsonify({'status': 'ERROR', 'message': 'Missing Stripe-Signature header'}), 400
 
     if not event or not isinstance(event, dict):
         return jsonify({'status': 'ERROR', 'message': 'Malformed event payload'}), 400

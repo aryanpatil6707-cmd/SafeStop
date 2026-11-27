@@ -42,10 +42,10 @@ SafeRide AI gives parents full peace of mind by answering four key questions in 
 
 ## 🏛️ Multi-Tenancy Architecture (Institutional Isolation)
 
-SafeStop supports multiple school/college institutions natively (`kbp-vashi`, `st-xaviers`).
+SafeStop supports multiple school/college institutions natively.
 - **Strict Data Scoping**: All database models (`User`, `Student`, `Driver`, `Bus`, `Route`, `Trip`, `Alert`, `AuditLog`) are institution-scoped.
-- **Cross-Tenant Guardrails**: Automatic authorization checks reject illegal cross-tenant data requests.
-- **Parent Self-Registration**: Parents can register directly using their school's unique `invite_code` (`KBP2026`, `STX2026`).
+- **Cross-Tenant Guardrails**: Automatic authorization checks reject illegal cross-tenant data requests and enforce tenant-scoped safety notifications.
+- **Parent Self-Registration**: Parents can register directly using the unique student invite code issued by their institution administrator.
 
 ---
 
@@ -88,70 +88,41 @@ python run.py
 
 Open **http://127.0.0.1:5000** in your browser.
 
-### 3. Database Management & Migrations
+### 3. Database Management & Initial Account Setup
 SafeStop uses Flask-Migrate (Alembic) for schema migrations:
 ```bash
 flask db upgrade                                  # Apply database migrations to production/local DB
 python manage_db.py status                        # View real-time database counts
-python manage_db.py seed                          # Seed demo dataset (KBP College Vashi)
-python manage_db.py create-admin --email <email>  # Create admin account
 ```
-*Note: `flask db upgrade` replaces `db.create_all()` for environments with persistent data.*
 
-### 4. Run Automated Test Suite
+#### Creating a Secure Initial Administrator Account
+Production deployments do **not** seed default administrator or driver accounts. Create your initial Super Admin and institutional Admin accounts explicitly via the CLI:
+```bash
+python manage_db.py create-superadmin --email superadmin@your-domain.com --password "<STRONG_PASSWORD>"
+python manage_db.py create-admin --email admin@your-school.edu --password "<STRONG_PASSWORD>" --name "Transport Director" --institution-slug your-school --institution-name "Your School Name"
+```
+
+#### Development-Only Synthetic Demo Dataset
+For local development testing only (blocked automatically when `FLASK_ENV=production` / `APP_ENV=production`):
+```bash
+python manage_db.py seed
+```
+This seeds clearly synthetic demonstration data (`Demo Academy Alpha`, `Demo Academy Beta`) with non-hardcoded credentials printed only to your local terminal (or supplied via `DEV_DEMO_ADMIN_PASSWORD`, `DEV_DEMO_DRIVER_PASSWORD`, `DEV_DEMO_PARENT_PASSWORD`).
+
+### 4. Required Production Environment Variables
+When deploying in production (`FLASK_ENV=production`), the application enforces explicit configuration and refuses to boot with development defaults:
+- `FLASK_ENV=production` (or `APP_ENV=production`)
+- `SECRET_KEY` — Strong random secret key (not a development placeholder)
+- `WTF_CSRF_SECRET_KEY` — Strong random CSRF secret key (not a development placeholder)
+- `DATABASE_URL` — Production PostgreSQL connection string
+- `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET` — Live/test Stripe credentials (no mock placeholders; `STRIPE_WEBHOOK_SECRET` is required to accept signed Stripe webhook events)
+- `EMAIL_PROVIDER` (`smtp` or `none`, default `none`): Password reset fails closed without exposing reset tokens or URLs unless an outbound SMTP provider is configured (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS`, `MAIL_FROM_ADDRESS`).
+
+### 5. Run Automated Test Suite
 Execute unit tests using pytest:
 ```bash
 python -m pytest
 ```
-*Passes 18 automated test cases covering DB init, auth, wrong-bus detection, parent absence, driver telemetry, and parent proximity alerts.*
-
----
-
-## 🔑 Stored Database Credentials
-
-The database (`saferide.db`) is pre-populated with ready-to-use accounts:
-
-### 👑 System Administrator (College/School Admin)
-- **Email / ID**: `admin@saferide.ai`
-- **Password**: `admin123`
-- **Role**: Institutional Transport Director / Admin
-- **Access URL**: [http://127.0.0.1:5000/auth/login](http://127.0.0.1:5000/auth/login)
-- **Features**: Fleet Control Center, AI Risk Analytics, Add/Manage Buses, Drivers, Routes & Students.
-
-### 🚘 Bus Driver Account
-- **Email / ID**: `driver1@saferide.ai`
-- **Password**: `driver123`
-- **Role**: Official Bus Driver (BUS-05)
-- **Access URL**: [http://127.0.0.1:5000/auth/login](http://127.0.0.1:5000/auth/login)
-- **Features**: Start/End Trip, AI Facial Camera Verification, Live GPS Broadcast, SOS Alert.
-
-### 👪 Student Parent Accounts
-- **Password for all Parents (`parent1@saferide.ai` to `parent15@saferide.ai`)**: `parent123`
-- **Features**: Track Child Live Location, Safe Drop Arrival Confirmation, Instant Boarding Alerts.
-
----
-
-## 🎓 Stored Student Dataset — Karmaveer Bhaurao Patil (KBP) College, Vashi
-
-All 15 students have registered daily commutes from **Home ➔ KBP College Vashi (Morning)** and **KBP College Vashi ➔ Home (Evening)**:
-
-| # | Student Name | Roll Number | Department / Grade | Home Pickup & Drop Stop | Destination | Bus | Parent Login |
-|---|---|---|---|---|---|---|---|
-| 1 | **Manthan Patil** | `KBP-2026-CS501` | B.Sc Computer Science (3rd Yr) | Sector 17 Vashi Plaza | KBP College Main Gate | BUS-05 | `parent1@saferide.ai` |
-| 2 | **Ananya Sharma** | `KBP-2026-102` | B.Com (1st Yr) | Sector 9 Vashi Market | KBP College Main Gate | BUS-05 | `parent2@saferide.ai` |
-| 3 | **Rohan Verma** | `KBP-2026-103` | B.Sc IT (3rd Yr) | Kopar Khairane Station Circle | KBP College Main Gate | BUS-05 | `parent3@saferide.ai` |
-| 4 | **Ishita Gupta** | `KBP-2026-104` | BBA (2nd Yr) | CBD Belapur Station | KBP College Main Gate | BUS-08 | `parent4@saferide.ai` |
-| 5 | **Aarav Deshmukh** | `KBP-2026-105` | B.Sc Data Science (2nd Yr) | Nerul LP Junction (Sec 21) | KBP College Main Gate | BUS-08 | `parent5@saferide.ai` |
-| 6 | **Sanya Kulkarni** | `KBP-2026-106` | M.Sc CS (1st Yr) | Juinagar Station West | KBP College Main Gate | BUS-08 | `parent6@saferide.ai` |
-| 7 | **Aditya Shinde** | `KBP-2026-107` | B.Tech AI (1st Yr) | Sector 17 Vashi Plaza | KBP College Main Gate | BUS-05 | `parent7@saferide.ai` |
-| 8 | **Riya More** | `KBP-2026-108` | B.A. Mass Comm (3rd Yr) | Sector 9 Vashi Market | KBP College Main Gate | BUS-05 | `parent8@saferide.ai` |
-| 9 | **Kabir Joshi** | `KBP-2026-109` | B.Sc Biotech (2nd Yr) | Kopar Khairane Station Circle | KBP College Main Gate | BUS-05 | `parent9@saferide.ai` |
-| 10 | **Tanvi Bhosale** | `KBP-2026-110` | B.Com Accounting (1st Yr) | CBD Belapur Station | KBP College Main Gate | BUS-08 | `parent10@saferide.ai` |
-| 11 | **Yash Pawar** | `KBP-2026-111` | B.Sc MicroBiology (3rd Yr) | Nerul LP Junction (Sec 21) | KBP College Main Gate | BUS-08 | `parent11@saferide.ai` |
-| 12 | **Prisha Nambiar** | `KBP-2026-112` | BMS Management (2nd Yr) | Juinagar Station West | KBP College Main Gate | BUS-08 | `parent12@saferide.ai` |
-| 13 | **Siddharth Chavan** | `KBP-2026-113` | B.Sc Cyber Security (1st Yr) | Sector 17 Vashi Plaza | KBP College Main Gate | BUS-05 | `parent13@saferide.ai` |
-| 14 | **Neha Thorat** | `KBP-2026-114` | M.Com Finance (2nd Yr) | Sector 9 Vashi Market | KBP College Main Gate | BUS-05 | `parent14@saferide.ai` |
-| 15 | **Varun Kadam** | `KBP-2026-115` | B.Sc Chemistry (3rd Yr) | Kopar Khairane Station Circle | KBP College Main Gate | BUS-05 | `parent15@saferide.ai` |
 
 ---
 

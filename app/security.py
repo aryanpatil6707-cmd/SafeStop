@@ -7,7 +7,9 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.utils import secure_filename
 
 def get_serializer():
-    secret = current_app.config.get('SECRET_KEY', 'default-secret-key')
+    secret = current_app.config.get('SECRET_KEY')
+    if not secret:
+        raise RuntimeError("SECRET_KEY is not configured.")
     return URLSafeTimedSerializer(secret)
 
 # --- CSRF PROTECTION ENGINE ---
@@ -93,10 +95,12 @@ def generate_password_reset_token(user_id):
 
 def verify_password_reset_token(token, max_age_seconds=1800):
     """Verifies and decodes a password reset token."""
+    if not token or not isinstance(token, str):
+        return None
     serializer = get_serializer()
     try:
         data = serializer.loads(token, salt='password-reset-salt', max_age=max_age_seconds)
-        return data.get('user_id')
+        return data.get('user_id') if isinstance(data, dict) else None
     except (BadSignature, SignatureExpired):
         return None
 
