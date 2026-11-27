@@ -13,6 +13,9 @@ def create_checkout_session():
     """
     Creates a Stripe Checkout Session for subscription purchasing/upgrading.
     """
+    if not current_app.config.get('STRIPE_BILLING_ENABLED', True):
+        return jsonify({'status': 'ERROR', 'message': 'Stripe billing is disabled.'}), 503
+
     if request.is_json:
         data = request.get_json(silent=True) or {}
     else:
@@ -28,6 +31,8 @@ def create_checkout_session():
         'ENTERPRISE': current_app.config.get('STRIPE_PRICE_ID_ENTERPRISE')
     }
     price_id = price_map.get(target_tier)
+    if not price_id:
+        return jsonify({'status': 'ERROR', 'message': 'Stripe plan price is not configured.'}), 503
 
     stripe_api_key = current_app.config.get('STRIPE_SECRET_KEY')
     if not stripe_api_key or (
@@ -77,8 +82,11 @@ def stripe_webhook():
     """
     Handles Stripe asynchronous webhook events (CSRF exempted).
     Requires Stripe-Signature verification in all non-testing environments and
-    always rejects unsigned or invalidly signed requests in production.
+    always rejects unsigned or invalidly signed requests in production or when billing is disabled.
     """
+    if not current_app.config.get('STRIPE_BILLING_ENABLED', True):
+        return jsonify({'status': 'ERROR', 'message': 'Stripe billing is disabled.'}), 503
+
     payload = request.get_data(as_text=True)
     sig_header = request.headers.get('Stripe-Signature')
     endpoint_secret = current_app.config.get('STRIPE_WEBHOOK_SECRET')

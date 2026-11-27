@@ -115,7 +115,9 @@ When deploying in production (`FLASK_ENV=production`), the application enforces 
 - `SECRET_KEY` — Strong random secret key (not a development placeholder)
 - `WTF_CSRF_SECRET_KEY` — Strong random CSRF secret key (not a development placeholder)
 - `DATABASE_URL` — Production PostgreSQL connection string
-- `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET` — Live/test Stripe credentials (no mock placeholders; `STRIPE_WEBHOOK_SECRET` is required to accept signed Stripe webhook events)
+- `STRIPE_BILLING_ENABLED` (`true` or `false`, default `true` in production):
+  - When enabled (`true`), `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, and `STRIPE_WEBHOOK_SECRET` are **strictly required** at production startup (missing or mock placeholder values fail startup). Optional price IDs (`STRIPE_PRICE_ID_STARTER`, `STRIPE_PRICE_ID_PROFESSIONAL`, `STRIPE_PRICE_ID_ENTERPRISE`) are required to initiate checkout for the corresponding tier.
+  - When intentionally disabled (`STRIPE_BILLING_ENABLED=false`), production starts without Stripe credentials, checkout requests fail safely (`503`), and webhook requests (including unsigned events) are rejected (`503`).
 - `EMAIL_PROVIDER` (`smtp` or `none`, default `none`): Password reset fails closed without exposing reset tokens or URLs unless an outbound SMTP provider is configured (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS`, `MAIL_FROM_ADDRESS`).
 
 ### 5. Run Automated Test Suite

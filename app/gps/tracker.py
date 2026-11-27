@@ -51,22 +51,29 @@ def check_and_escalate_pending_safe_drops():
         drop.status = 'ESCALATED'
         inst_id = (drop.trip.institution_id if drop.trip else None) or (drop.student.institution_id if drop.student else None)
 
+        if not inst_id:
+            logger.error(
+                f"Cannot create SAFE_DROP_PENDING alert or notify admins for SafeDropConfirmation #{drop.id}: missing institution_id."
+            )
+            continue
+
+        student_name = drop.student.full_name if drop.student else f"Student #{drop.student_id}"
         escalated_alert = Alert(
-            institution_id=inst_id or 1,
+            institution_id=inst_id,
             bus_id=drop.trip.bus_id if drop.trip else None,
             trip_id=drop.trip_id,
             student_id=drop.student_id,
             alert_type='SAFE_DROP_PENDING',
             risk_score=35,
             severity='CRITICAL',
-            description=f"UNCONFIRMED SAFE DROP ESCALATION! Parent confirmation pending for {drop.student.full_name} for >{escalation_mins} minutes."
+            description=f"UNCONFIRMED SAFE DROP ESCALATION! Parent confirmation pending for {student_name} for >{escalation_mins} minutes."
         )
         db.session.add(escalated_alert)
 
         from app.notifications.service import broadcast_admin_notification
         broadcast_admin_notification(
             title="⚠️ UNCONFIRMED SAFE DROP ESCALATION",
-            message=f"Parent confirmation pending for {drop.student.full_name} (> {escalation_mins} mins).",
+            message=f"Parent confirmation pending for {student_name} (> {escalation_mins} mins).",
             category="EMERGENCY",
             institution_id=inst_id
         )

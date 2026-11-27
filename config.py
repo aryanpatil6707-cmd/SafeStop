@@ -28,6 +28,23 @@ def _is_insecure_secret(value):
     return val in _DISALLOWED_PRODUCTION_SECRETS or val.startswith('dev-insecure-')
 
 
+def _validate_stripe_production_settings(billing_enabled, secret_key, publishable_key, webhook_secret):
+    """Validate Stripe credentials in production according to STRIPE_BILLING_ENABLED."""
+    for key_name, val in (
+        ('STRIPE_SECRET_KEY', secret_key),
+        ('STRIPE_PUBLISHABLE_KEY', publishable_key),
+        ('STRIPE_WEBHOOK_SECRET', webhook_secret),
+    ):
+        if val and any(str(val).strip().startswith(prefix) for prefix in _DISALLOWED_PRODUCTION_STRIPE_PREFIXES):
+            raise ValueError(
+                f"CRITICAL SECURITY ERROR: '{key_name}' cannot use a placeholder mock value in production!"
+            )
+        if billing_enabled and (not val or not str(val).strip()):
+            raise ValueError(
+                f"CRITICAL SECURITY ERROR: '{key_name}' environment variable MUST be configured in production when Stripe billing is enabled (or set STRIPE_BILLING_ENABLED=false to disable billing)!"
+            )
+
+
 def validate_production_config(cfg):
     """Enforce mandatory security configuration when running in production."""
     env = str(cfg.get('ENV', 'development')).lower()
@@ -44,12 +61,12 @@ def validate_production_config(cfg):
             "CRITICAL SECURITY ERROR: 'WTF_CSRF_SECRET_KEY' environment variable MUST be explicitly configured with a secure production value!"
         )
 
-    for stripe_key_name in ('STRIPE_SECRET_KEY', 'STRIPE_PUBLISHABLE_KEY', 'STRIPE_WEBHOOK_SECRET'):
-        val = cfg.get(stripe_key_name)
-        if val and any(str(val).startswith(prefix) for prefix in _DISALLOWED_PRODUCTION_STRIPE_PREFIXES):
-            raise ValueError(
-                f"CRITICAL SECURITY ERROR: '{stripe_key_name}' cannot use a placeholder mock value in production!"
-            )
+    _validate_stripe_production_settings(
+        bool(cfg.get('STRIPE_BILLING_ENABLED', True)),
+        cfg.get('STRIPE_SECRET_KEY'),
+        cfg.get('STRIPE_PUBLISHABLE_KEY'),
+        cfg.get('STRIPE_WEBHOOK_SECRET'),
+    )
 
 
 class Config:
@@ -144,6 +161,8 @@ class Config:
     OUTBOUND_SMS_CATEGORIES = {'BOARDING', 'ARRIVAL', 'SAFE_DROP', 'EMERGENCY', 'WRONG_BUS', 'NO_SHOW', 'UNSCANNED_DROP'}
 
     # Stripe Billing Configuration (never use mock placeholders in production)
+    STRIPE_BILLING_ENABLED = os.environ.get('STRIPE_BILLING_ENABLED', 'true').lower() in ('1', 'true', 'yes')
+
     if ENV == 'production':
         STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY')
         STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY')
@@ -152,17 +171,12 @@ class Config:
         STRIPE_PRICE_ID_PROFESSIONAL = os.environ.get('STRIPE_PRICE_ID_PROFESSIONAL')
         STRIPE_PRICE_ID_ENTERPRISE = os.environ.get('STRIPE_PRICE_ID_ENTERPRISE')
 
-        for _stripe_key, _val in (
-            ('STRIPE_SECRET_KEY', STRIPE_SECRET_KEY),
-            ('STRIPE_PUBLISHABLE_KEY', STRIPE_PUBLISHABLE_KEY),
-            ('STRIPE_WEBHOOK_SECRET', STRIPE_WEBHOOK_SECRET),
-        ):
-            if _val:
-                for _prefix in _DISALLOWED_PRODUCTION_STRIPE_PREFIXES:
-                    if str(_val).startswith(_prefix):
-                        raise ValueError(
-                            f"CRITICAL SECURITY ERROR: '{_stripe_key}' cannot use a placeholder mock value in production!"
-                        )
+        _validate_stripe_production_settings(
+            STRIPE_BILLING_ENABLED,
+            STRIPE_SECRET_KEY,
+            STRIPE_PUBLISHABLE_KEY,
+            STRIPE_WEBHOOK_SECRET,
+        )
     else:
         STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', 'sk_test_mock_secret_key_2026')
         STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY', 'pk_test_mock_publishable_key_2026')

@@ -11,6 +11,7 @@ import stripe
 from app import create_app
 from app.gps.tracker import check_and_escalate_pending_safe_drops
 from app.models import (
+    Alert,
     Bus,
     Driver,
     Institution,
@@ -400,12 +401,26 @@ def test_production_config_safeguards(monkeypatch):
         # Placeholder Stripe secret rejected in production
         monkeypatch.setenv('SECRET_KEY', 'prod-secret-key-very-strong-random-value')
         monkeypatch.setenv('WTF_CSRF_SECRET_KEY', 'prod-csrf-key-very-strong-random-value')
+        monkeypatch.setenv('STRIPE_BILLING_ENABLED', 'true')
+        monkeypatch.setenv('STRIPE_SECRET_KEY', 'sk_prod_test_placeholder_0001')
+        monkeypatch.setenv('STRIPE_PUBLISHABLE_KEY', 'pk_prod_test_placeholder_0001')
         monkeypatch.setenv('STRIPE_WEBHOOK_SECRET', 'whsec_mock_webhook_secret_2026')
         with pytest.raises(ValueError, match="STRIPE_WEBHOOK_SECRET"):
             importlib.reload(config)
 
-        # Valid production config enforces non-debug & secure cookie settings
+        # Missing Stripe credentials rejected in production when billing is enabled
         monkeypatch.delenv('STRIPE_WEBHOOK_SECRET', raising=False)
+        with pytest.raises(ValueError, match="STRIPE_WEBHOOK_SECRET"):
+            importlib.reload(config)
+
+        monkeypatch.delenv('STRIPE_SECRET_KEY', raising=False)
+        with pytest.raises(ValueError, match="STRIPE_SECRET_KEY"):
+            importlib.reload(config)
+
+        # Valid configured billing in production succeeds and enforces non-debug & secure cookies
+        monkeypatch.setenv('STRIPE_SECRET_KEY', 'sk_test_non_placeholder_configured_key')
+        monkeypatch.setenv('STRIPE_PUBLISHABLE_KEY', 'pk_test_non_placeholder_configured_key')
+        monkeypatch.setenv('STRIPE_WEBHOOK_SECRET', 'whsec_non_placeholder_configured_secret')
         monkeypatch.setenv('FLASK_DEBUG', 'true')
         importlib.reload(config)
         assert config.Config.DEBUG is False
@@ -413,15 +428,175 @@ def test_production_config_safeguards(monkeypatch):
         assert config.Config.SESSION_COOKIE_HTTPONLY is True
         assert config.Config.SESSION_COOKIE_SAMESITE == 'Lax'
         assert config.Config.REMEMBER_COOKIE_SECURE is True
+        assert config.Config.STRIPE_BILLING_ENABLED is True
+
+        # Intentionally disabled billing in production succeeds without Stripe keys
+        monkeypatch.setenv('STRIPE_BILLING_ENABLED', 'false')
+        monkeypatch.delenv('STRIPE_SECRET_KEY', raising=False)
+        monkeypatch.delenv('STRIPE_PUBLISHABLE_KEY', raising=False)
+        monkeypatch.delenv('STRIPE_WEBHOOK_SECRET', raising=False)
+        importlib.reload(config)
+        assert config.Config.STRIPE_BILLING_ENABLED is False
         assert config.Config.STRIPE_SECRET_KEY is None
+        assert config.Config.STRIPE_PUBLISHABLE_KEY is None
         assert config.Config.STRIPE_WEBHOOK_SECRET is None
     finally:
         monkeypatch.setenv('FLASK_ENV', 'development')
         monkeypatch.delenv('SECRET_KEY', raising=False)
         monkeypatch.delenv('WTF_CSRF_SECRET_KEY', raising=False)
+        monkeypatch.delenv('STRIPE_BILLING_ENABLED', raising=False)
+        monkeypatch.delenv('STRIPE_SECRET_KEY', raising=False)
+        monkeypatch.delenv('STRIPE_PUBLISHABLE_KEY', raising=False)
         monkeypatch.delenv('STRIPE_WEBHOOK_SECRET', raising=False)
         monkeypatch.delenv('FLASK_DEBUG', raising=False)
         importlib.reload(config)
+
+
+def test_safe_drop_escalation_valid_and_missing_institution(phase1a_app, caplog):
+    app = phase1a_app['app']
+    inst_a_id = phase1a_app['inst_a_id']
+    inst_b_id = phase1a_app['inst_b_id']
+    admin_a_id = phase1a_app['admin_a_id']
+    admin_b_id = phase1a_app['admin_b_id']
+    caplog.set_level(logging.ERROR)
+
+    with app.app_context():
+        # Create a valid Institution B student & trip (explicitly not institution 1)
+        bus_b = Bus.query.filter_by(institution_id=inst_b_id).first()
+        driver_b = Driver.query.filter_by(institution_id=inst_b_id).first()
+        route_b = Route.query.filter_by(institution_id=inst_b_id).first()
+        stop_b = Stop(institution_id=inst_b_id, route_id=route_b.id, stop_name="Stop B", sequence_order=1, latitude=19.1, longitude=72.9)
+        db.session.add(stop_b)
+        db.session.flush()
+
+        parent_b_u = User(institution_id=inst_b_id, email="parent_b@example.com", role="PARENT", full_name="Parent B")
+        parent_b_u.set_password("StrongPassB!3")
+        db.session.add(parent_b_u)
+        db.session.flush()
+        parent_b = Parent(institution_id=inst_b_id, user_id=parent_b_u.id)
+        db.session.add(parent_b)
+        db.session.flush()
+
+        student_b = Student(
+            institution_id=inst_b_id,
+            full_name="Student B",
+            roll_number="STU-B1",
+            parent_id=parent_b.id,
+            assigned_bus_id=bus_b.id,
+            assigned_route_id=route_b.id,
+            drop_stop_id=stop_b.id,
+        )
+        db.session.add(student_b)
+        db.session.flush()
+
+        trip_b = Trip(
+            institution_id=inst_b_id,
+            bus_id=bus_b.id,
+            driver_id=driver_b.id,
+            route_id=route_b.id,
+            trip_type="EVENING_DROP",
+            status="IN_PROGRESS",
+            start_time=datetime.utcnow(),
+        )
+        db.session.add(trip_b)
+        db.session.flush()
+
+        sd_valid = SafeDropConfirmation(
+            student_id=student_b.id,
+            trip_id=trip_b.id,
+            stop_id=stop_b.id,
+            parent_id=parent_b.id,
+            bus_arrival_time=datetime.utcnow() - timedelta(minutes=30),
+            status='PENDING',
+        )
+        db.session.add(sd_valid)
+        db.session.commit()
+
+        check_and_escalate_pending_safe_drops()
+
+        assert db.session.get(SafeDropConfirmation, sd_valid.id).status == 'ESCALATED'
+        alerts_b = Alert.query.filter_by(institution_id=inst_b_id, alert_type='SAFE_DROP_PENDING').all()
+        assert len(alerts_b) == 1
+        assert Alert.query.filter_by(institution_id=inst_a_id, alert_type='SAFE_DROP_PENDING').count() == 0
+        assert Notification.query.filter_by(user_id=admin_b_id).count() == 1
+        assert Notification.query.filter_by(user_id=admin_a_id).count() == 0
+
+        # Missing institution context must fail closed (no fallback to institution 1)
+        Alert.query.delete()
+        Notification.query.delete()
+        db.session.commit()
+        caplog.clear()
+
+        sd_orphan = SafeDropConfirmation(
+            student_id=999999,
+            trip_id=999999,
+            stop_id=999999,
+            parent_id=999999,
+            bus_arrival_time=datetime.utcnow() - timedelta(minutes=30),
+            status='PENDING',
+        )
+        db.session.add(sd_orphan)
+        db.session.commit()
+
+        check_and_escalate_pending_safe_drops()
+
+        assert db.session.get(SafeDropConfirmation, sd_orphan.id).status == 'ESCALATED'
+        assert Alert.query.count() == 0
+        assert Alert.query.filter_by(institution_id=1).count() == 0
+        assert Notification.query.count() == 0
+        assert "missing institution_id" in caplog.text
+
+
+def test_stripe_disabled_mode_and_non_testing_unsigned_rejection(phase1a_app):
+    client = phase1a_app['client']
+    app = phase1a_app['app']
+    admin_a_id = phase1a_app['admin_a_id']
+    inst_a_id = phase1a_app['inst_a_id']
+
+    payload = {
+        'type': 'checkout.session.completed',
+        'data': {
+            'object': {
+                'client_reference_id': str(inst_a_id),
+                'customer': 'cus_disabled_test',
+                'subscription': 'sub_disabled_test',
+                'metadata': {'target_plan_tier': 'ENTERPRISE'},
+            }
+        },
+    }
+
+    # 1. Outside isolated tests (TESTING=False), unsigned webhooks are rejected even in development
+    app.config['ENV'] = 'development'
+    app.config['TESTING'] = False
+    app.config['STRIPE_BILLING_ENABLED'] = True
+    res_unsigned_non_test = client.post('/billing/webhook', json=payload)
+    assert res_unsigned_non_test.status_code == 400
+    assert 'Stripe-Signature' in res_unsigned_non_test.get_json()['message']
+
+    # 2. When billing is intentionally disabled, checkout fails safely and webhooks reject unsigned events even in TESTING=True
+    app.config['ENV'] = 'production'
+    app.config['TESTING'] = True
+    app.config['STRIPE_BILLING_ENABLED'] = False
+    app.config['STRIPE_SECRET_KEY'] = None
+    app.config['STRIPE_PUBLISHABLE_KEY'] = None
+    app.config['STRIPE_WEBHOOK_SECRET'] = None
+
+    with client.session_transaction() as sess:
+        sess['_user_id'] = str(admin_a_id)
+        sess['_fresh'] = True
+
+    res_checkout = client.post('/billing/create-checkout-session', json={'plan_tier': 'PROFESSIONAL'})
+    assert res_checkout.status_code == 503
+    assert res_checkout.get_json()['status'] == 'ERROR'
+
+    res_webhook_unsigned = client.post('/billing/webhook', json=payload)
+    assert res_webhook_unsigned.status_code == 503
+    assert res_webhook_unsigned.get_json()['status'] == 'ERROR'
+
+    with app.app_context():
+        inst_a = db.session.get(Institution, inst_a_id)
+        assert inst_a.stripe_customer_id is None
+        assert inst_a.stripe_subscription_id is None
 
 
 def test_seed_database_blocked_in_production(monkeypatch):
