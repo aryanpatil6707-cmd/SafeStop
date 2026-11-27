@@ -38,8 +38,8 @@ def send_notification(user_id, title, message, category='INFO', action_link=None
     return notif
 
 
-def _dispatch_group_notifications(users, title, message, category='EMERGENCY'):
-    """Persist in-app notifications and dispatch outbound SMS for a verified list of users."""
+def _dispatch_group_notifications(users, title, message, category='EMERGENCY', commit=True):
+    """Persist in-app notifications and optionally commit/dispatch outbound SMS for a verified list of users."""
     notifs = []
     outbound_categories = getattr(current_app, 'config', {}).get(
         'OUTBOUND_SMS_CATEGORIES',
@@ -57,17 +57,20 @@ def _dispatch_group_notifications(users, title, message, category='EMERGENCY'):
         db.session.add(n)
         notifs.append(n)
 
-        if provider and user.has_valid_phone():
-            try:
-                provider.send_sms(user.phone, f"{title}: {message}")
-            except Exception as e:
-                logger.error(f"Outbound admin notification delivery failed for user {user.id}: {e}")
+    if commit:
+        db.session.commit()
+        if provider:
+            for user in users:
+                if user.has_valid_phone():
+                    try:
+                        provider.send_sms(user.phone, f"{title}: {message}")
+                    except Exception as e:
+                        logger.error(f"Outbound admin notification delivery failed for user {user.id}: {e}")
 
-    db.session.commit()
     return notifs
 
 
-def broadcast_admin_notification(title, message, category='EMERGENCY', institution_id=None):
+def broadcast_admin_notification(title, message, category='EMERGENCY', institution_id=None, commit=True):
     """Broadcast notification strictly to active school admins belonging to the specified institution."""
     if institution_id is None:
         logger.warning("Refusing unscoped broadcast_admin_notification without institution_id.")
@@ -78,7 +81,27 @@ def broadcast_admin_notification(title, message, category='EMERGENCY', instituti
         is_active=True,
         institution_id=institution_id
     ).all()
-    return _dispatch_group_notifications(admins, title, message, category=category)
+    return _dispatch_group_notifications(admins, title, message, category=category, commit=commit)
+
+
+def dispatch_sms_for_institution_admins(institution_id, title, message, category='EMERGENCY'):
+    """Best-effort outbound SMS dispatch after an atomic commit succeeds."""
+    if institution_id is None:
+        return
+    outbound_categories = getattr(current_app, 'config', {}).get(
+        'OUTBOUND_SMS_CATEGORIES',
+        {'BOARDING', 'ARRIVAL', 'SAFE_DROP', 'EMERGENCY', 'WRONG_BUS'}
+    )
+    if category not in outbound_categories:
+        return
+    provider = get_notification_provider()
+    admins = User.query.filter_by(role='ADMIN', is_active=True, institution_id=institution_id).all()
+    for admin in admins:
+        if admin.has_valid_phone():
+            try:
+                provider.send_sms(admin.phone, f"{title}: {message}")
+            except Exception as e:
+                logger.error(f"Outbound admin notification delivery failed for admin {admin.id}: {e}")
 
 
 def broadcast_superadmin_notification(title, message, category='EMERGENCY'):

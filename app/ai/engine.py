@@ -9,17 +9,26 @@ from app.models import db, Student, Bus, Trip, Attendance, Alert, Notification, 
 
 logger = logging.getLogger(__name__)
 
-def decode_image_base64(b64_string):
-    """Decode base64 image data to OpenCV BGR image numpy array."""
+def decode_image_base64(b64_string, max_bytes=None):
+    """Decode base64 image data to OpenCV BGR image numpy array without logging raw image data."""
+    if not b64_string or not isinstance(b64_string, str):
+        return None
     try:
-        if ',' in b64_string:
-            b64_string = b64_string.split(',')[1]
-        img_bytes = base64.b64decode(b64_string)
+        payload = b64_string.split(',', 1)[1] if ',' in b64_string else b64_string
+        limit = max_bytes or getattr(Config, 'MAX_OFFLINE_IMAGE_SIZE_BYTES', 2 * 1024 * 1024)
+        # Approximate decoded size guard prior to full decode
+        if len(payload) > int(limit * 1.4) + 64:
+            logger.warning("Rejected oversized base64 image payload.")
+            return None
+        img_bytes = base64.b64decode(payload, validate=True)
+        if len(img_bytes) > limit:
+            logger.warning("Rejected decoded image exceeding maximum byte limit.")
+            return None
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return img
     except Exception as e:
-        logger.error(f"Error decoding base64 image: {e}")
+        logger.error(f"Error decoding base64 image ({type(e).__name__})")
         return None
 
 
@@ -95,9 +104,24 @@ def compare_feature_vectors(vec1, vec2):
 def identify_student_from_face(image_b64, active_trip_id=None, institution_id=None):
     """
     Given a camera capture image base64, identify matching student in DB.
-    Restricts search candidates strictly to students in the specified institution.
-    Returns dict with match status, student object, confidence %, and verification status.
+    Enforces strict tenant isolation and explicit parental biometric consent:
+    - Fails closed if institution context cannot be resolved.
+    - Matches ONLY profiles with parental_consent_given=True and is_archived=False.
     """
+    # Resolve and validate target institution_id BEFORE decoding/searching
+    target_inst_id = institution_id
+    if active_trip_id is not None:
+        trip = db.session.get(Trip, active_trip_id)
+        if not trip:
+            return {'status': 'ERROR', 'message': 'Invalid trip reference.'}
+        if target_inst_id is not None and trip.institution_id != target_inst_id:
+            return {'status': 'ERROR', 'message': 'Trip institution mismatch.'}
+        if target_inst_id is None:
+            target_inst_id = trip.institution_id
+
+    if not target_inst_id:
+        return {'status': 'ERROR', 'message': 'Institution context is required for face identification.'}
+
     cv_img = decode_image_base64(image_b64)
     if cv_img is None:
         return {'status': 'ERROR', 'message': 'Invalid camera frame'}
@@ -106,22 +130,21 @@ def identify_student_from_face(image_b64, active_trip_id=None, institution_id=No
     if query_vector is None:
         return {'status': 'NO_FACE', 'message': 'No facial features detected. Please align camera.'}
 
-    # Determine target institution_id for tenant isolation
-    target_inst_id = institution_id
-    if target_inst_id is None and active_trip_id is not None:
-        trip = db.session.get(Trip, active_trip_id)
-        if trip:
-            target_inst_id = trip.institution_id
-
-    # Fetch face profiles scoped strictly to institution if identified (excluding archived profiles)
-    query = FaceProfile.query.filter(FaceProfile.is_archived == False).join(Student)
-    if target_inst_id is not None:
-        query = query.filter(Student.institution_id == target_inst_id)
-
-    profiles = query.all()
+    # Fetch face profiles strictly scoped to institution with active parental consent
+    profiles = (
+        FaceProfile.query
+        .join(Student, FaceProfile.student_id == Student.id)
+        .filter(
+            FaceProfile.parental_consent_given == True,
+            FaceProfile.is_archived == False,
+            Student.institution_id == target_inst_id,
+        )
+        .all()
+    )
     if not profiles:
-        return {'status': 'NO_PROFILES', 'message': 'No registered student face profiles in system.'}
+        return {'status': 'NO_PROFILES', 'message': 'No consented student face profiles available for this institution.'}
 
+    best_match_profile = None
     best_match_student = None
     highest_similarity = 0.0
 
@@ -130,11 +153,19 @@ def identify_student_from_face(image_b64, active_trip_id=None, institution_id=No
         sim = compare_feature_vectors(query_vector, stored_vec)
         if sim > highest_similarity:
             highest_similarity = sim
+            best_match_profile = prof
             best_match_student = prof.student
 
-    # Synchronized Threshold comparison from Config
+    # Synchronized Threshold comparison from Config + final consent/tenant verification
     threshold = getattr(Config, 'FACE_MATCH_SIMILARITY_THRESHOLD', 0.55)
-    if best_match_student and highest_similarity >= threshold:
+    if (
+        best_match_profile
+        and best_match_student
+        and best_match_profile.parental_consent_given is True
+        and best_match_profile.is_archived is False
+        and best_match_student.institution_id == target_inst_id
+        and highest_similarity >= threshold
+    ):
         confidence = min(99.0, round(highest_similarity * 100, 1))
         return {
             'status': 'MATCHED',

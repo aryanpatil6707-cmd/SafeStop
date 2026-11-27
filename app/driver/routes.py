@@ -1,13 +1,376 @@
-from datetime import datetime
-from flask import Blueprint, render_template, redirect, url_for, flash, request, jsonify
+import logging
+import math
+from datetime import datetime, timedelta, timezone
+from flask import Blueprint, render_template, redirect, url_for, flash, request, jsonify, current_app
 from flask_login import login_required, current_user  # type: ignore # pyright: ignore[reportMissingImports]
+from sqlalchemy.exc import IntegrityError
 from app import role_required
 from app.tenancy import require_feature
 from app.models import db, Driver, Bus, Route, Stop, Trip, Student, Attendance, Alert, Notification, GpsLocation, EmergencyEvent, StudentAbsenceRequest, DriverSafetyTelemetry, User, AuditLog
 from app.ai.engine import identify_student_from_face, check_bus_assignment, extract_face_features
 from app.gps.tracker import process_gps_update, update_driver_bus_location
 
+logger = logging.getLogger(__name__)
 driver_bp = Blueprint('driver', __name__)
+
+
+def _parse_json_payload():
+    """Safely parse JSON body and reject malformed payloads."""
+    data = request.get_json(silent=True)
+    if data is None or not isinstance(data, dict):
+        return None, (jsonify({'status': 'ERROR', 'result': 'rejected', 'message': 'Malformed or missing JSON object payload.'}), 400)
+    return data, None
+
+
+def _validate_client_event_id(raw_id):
+    """Validate optional client idempotency identifier."""
+    if raw_id is None or raw_id == '':
+        return None, None
+    if not isinstance(raw_id, str):
+        return None, 'Invalid client_event_id format.'
+    cleaned = raw_id.strip()
+    if not cleaned or len(cleaned) > 100:
+        return None, 'client_event_id must be 1 to 100 characters.'
+    return cleaned, None
+
+
+def _validate_coordinates(lat_raw, lng_raw):
+    """Validate optional latitude/longitude pair."""
+    if lat_raw is None and lng_raw is None:
+        return None, None, None
+    if lat_raw is None or lng_raw is None:
+        return None, None, 'Both latitude and longitude must be provided together.'
+    if isinstance(lat_raw, bool) or isinstance(lng_raw, bool):
+        return None, None, 'Invalid coordinate type.'
+    try:
+        lat_f = float(lat_raw)
+        lng_f = float(lng_raw)
+    except (ValueError, TypeError):
+        return None, None, 'Invalid latitude or longitude value.'
+    if math.isnan(lat_f) or math.isnan(lng_f) or math.isinf(lat_f) or math.isinf(lng_f):
+        return None, None, 'Coordinates must be finite numbers.'
+    if lat_f < -90.0 or lat_f > 90.0 or lng_f < -180.0 or lng_f > 180.0:
+        return None, None, 'Coordinates are out of valid geographic range.'
+    return lat_f, lng_f, None
+
+
+def _parse_iso_timestamp(raw_ts):
+    """Parse optional ISO-8601 timestamp normalized to naive UTC datetime."""
+    if raw_ts is None or raw_ts == '':
+        return datetime.utcnow(), None
+    if not isinstance(raw_ts, str):
+        return None, 'Invalid timestamp format.'
+    try:
+        dt = datetime.fromisoformat(raw_ts.strip().replace('Z', '+00:00'))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt, None
+    except ValueError:
+        return None, 'Invalid ISO-8601 timestamp.'
+
+
+def _validate_description(raw_desc, default_text):
+    """Validate and sanitize optional SOS description."""
+    if raw_desc is None:
+        return default_text, None
+    if not isinstance(raw_desc, str):
+        return None, 'Invalid description format.'
+    cleaned = raw_desc.strip()
+    if len(cleaned) > 1000:
+        return None, 'Description exceeds 1000 characters.'
+    return cleaned or default_text, None
+
+
+def _resolve_sos_context(driver, trip_id_raw, allowed_trip_statuses):
+    """Resolve and authorize trip, bus, and institution purely from trusted DB relationships."""
+    trip = None
+    if trip_id_raw is not None and trip_id_raw != '':
+        if isinstance(trip_id_raw, bool):
+            return None, None, None, 'Invalid trip ID.', 400
+        try:
+            trip_id_int = int(trip_id_raw)
+        except (ValueError, TypeError):
+            return None, None, None, 'Invalid trip ID.', 400
+        trip = db.session.get(Trip, trip_id_int)
+        if not trip:
+            return None, None, None, 'Trip reference not found.', 400
+        if trip.driver_id != driver.id:
+            return None, None, None, 'Access Denied: Unauthorized trip reference for SOS alert.', 403
+        if trip.status not in allowed_trip_statuses:
+            return None, None, None, f'Trip status {trip.status} is not valid for this SOS event.', 400
+        if driver.institution_id and trip.institution_id and trip.institution_id != driver.institution_id:
+            return None, None, None, 'Access Denied: Trip institution mismatch.', 403
+
+    bus_id = trip.bus_id if trip else driver.assigned_bus_id
+    inst_id = (trip.institution_id if trip else None) or driver.institution_id
+
+    if current_user.institution_id and inst_id and inst_id != current_user.institution_id:
+        return None, None, None, 'Access Denied: Institution mismatch.', 403
+    if not inst_id:
+        return None, None, None, 'Institution context could not be determined for SOS alert.', 400
+    if not bus_id:
+        return None, None, None, 'No assigned bus found for SOS alert.', 400
+
+    return trip, bus_id, inst_id, None, 200
+
+
+def _persist_sos_event(driver, trip, bus_id, inst_id, lat_f, lng_f, desc, triggered_at_dt, client_event_id, is_offline=False):
+    """Atomically persist an EmergencyEvent, institution-scoped Alert, and admin Notifications with idempotency."""
+    if client_event_id:
+        existing = EmergencyEvent.query.filter_by(
+            triggered_by_user_id=current_user.id,
+            client_event_id=client_event_id
+        ).first()
+        if existing:
+            return 'duplicate', existing, 'SOS event already recorded.'
+
+    bus = db.session.get(Bus, bus_id)
+    bus_code = bus.bus_code if bus else (driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A')
+    mode_tag = " (Offline Queue Synced)" if is_offline else ""
+    title = "🚨 CRITICAL EMERGENCY SOS (Offline Synced)" if is_offline else "🚨 CRITICAL EMERGENCY SOS"
+    notif_msg = (
+        f"Offline SOS Alert synced from Driver {current_user.full_name} on Bus {bus_code} (Triggered at {triggered_at_dt.strftime('%H:%M:%S UTC')})."
+        if is_offline
+        else f"SOS Alert received from Driver {current_user.full_name} on Bus {bus_code}."
+    )
+
+    sos_event = EmergencyEvent(
+        institution_id=inst_id,
+        bus_id=bus_id,
+        trip_id=trip.id if trip else None,
+        triggered_by_user_id=current_user.id,
+        client_event_id=client_event_id,
+        latitude=lat_f,
+        longitude=lng_f,
+        description=desc,
+        triggered_at=triggered_at_dt,
+    )
+    db.session.add(sos_event)
+
+    sos_alert = Alert(
+        institution_id=inst_id,
+        bus_id=bus_id,
+        trip_id=trip.id if trip else None,
+        alert_type='SOS_EMERGENCY',
+        risk_score=50,
+        severity='CRITICAL',
+        description=(
+            f"🚨 EMERGENCY SOS TRIGGERED{mode_tag} by Driver {current_user.full_name} "
+            f"for Bus {bus_code}. Triggered at {triggered_at_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+        ),
+    )
+    db.session.add(sos_alert)
+
+    from app.notifications.service import broadcast_admin_notification, dispatch_sms_for_institution_admins
+    broadcast_admin_notification(
+        title=title,
+        message=notif_msg,
+        category="EMERGENCY",
+        institution_id=inst_id,
+        commit=False,
+    )
+
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        if client_event_id:
+            existing = EmergencyEvent.query.filter_by(
+                triggered_by_user_id=current_user.id,
+                client_event_id=client_event_id
+            ).first()
+            if existing:
+                return 'duplicate', existing, 'SOS event already recorded.'
+        return 'retryable_failure', None, 'Database integrity error recording SOS alert.'
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(f"Database failure persisting SOS event ({type(exc).__name__})")
+        return 'retryable_failure', None, 'Database error recording SOS alert. Please retry.'
+
+    dispatch_sms_for_institution_admins(inst_id, title, notif_msg, category="EMERGENCY")
+    return 'accepted', sos_event, 'EMERGENCY SOS ALERT TRANSMITTED TO SCHOOL ADMIN'
+
+
+def _record_attendance_scan(driver, trip, student, confidence, scan_action, client_event_id=None, note_prefix="AI Face Recognition"):
+    """Persist BOARD or DROP attendance with consent, institution, wrong-bus, and idempotency checks."""
+    if student.institution_id != trip.institution_id:
+        return 'rejected', None, 'Student institution mismatch.'
+
+    fp = getattr(student, 'face_profile', None)
+    if not fp or fp.parental_consent_given is not True or fp.is_archived is True:
+        return 'rejected', None, 'Biometric consent is missing or revoked for this student.'
+
+    # Idempotency check by client_event_id
+    if client_event_id:
+        existing_by_event = Attendance.query.filter_by(
+            verified_by_driver_id=driver.id,
+            client_event_id=client_event_id
+        ).first()
+        if existing_by_event:
+            return 'already_processed', {
+                'status': 'DROP_VERIFIED' if scan_action == 'DROP' else 'ALREADY_BOARDED',
+                'student_id': student.id,
+                'student_name': student.full_name,
+                'roll_number': student.roll_number,
+                'message': f'{student.full_name} scan already processed.',
+            }, None
+
+    is_correct_bus, _, assigned_bus_code = check_bus_assignment(student.id, trip.bus_id)
+    if not is_correct_bus:
+        alert = Alert(
+            institution_id=trip.institution_id,
+            bus_id=trip.bus_id,
+            trip_id=trip.id,
+            student_id=student.id,
+            alert_type='WRONG_BUS',
+            risk_score=40,
+            severity='CRITICAL',
+            description=f"WRONG BUS DETECTED! Student {student.full_name} (Assigned: {assigned_bus_code}) boarded {trip.bus.bus_code}."
+        )
+        db.session.add(alert)
+        if student.parent and student.parent.user:
+            db.session.add(Notification(
+                user_id=student.parent.user.id,
+                title="🚨 WRONG BUS ALERT",
+                message=f"CRITICAL: Your child {student.full_name} was detected boarding BUS {trip.bus.bus_code} instead of assigned {assigned_bus_code}.",
+                category="WRONG_BUS"
+            ))
+        try:
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            logger.error(f"Database failure recording WRONG_BUS alert ({type(exc).__name__})")
+            return 'retryable_failure', None, 'Database error recording wrong-bus alert.'
+
+        return 'rejected', {
+            'status': 'WRONG_BUS',
+            'student_id': student.id,
+            'student_name': student.full_name,
+            'assigned_bus': assigned_bus_code,
+            'current_bus': trip.bus.bus_code,
+            'message': f"WRONG BUS DETECTED! Assigned to {assigned_bus_code}, boarded {trip.bus.bus_code}.",
+            'confidence': confidence,
+        }, f"Wrong bus detected for {student.full_name}."
+
+    existing_att = Attendance.query.filter_by(student_id=student.id, trip_id=trip.id).first()
+
+    if scan_action == 'DROP':
+        if existing_att and existing_att.is_dropped_off:
+            return 'already_processed', {
+                'status': 'ALREADY_DROPPED',
+                'student_id': student.id,
+                'student_name': student.full_name,
+                'roll_number': student.roll_number,
+                'message': f"{student.full_name} drop-off already recorded on this trip.",
+            }, None
+
+        if existing_att:
+            existing_att.is_dropped_off = True
+            existing_att.drop_verification_time = datetime.utcnow()
+            existing_att.scan_type = 'DROP'
+            if client_event_id and not existing_att.client_event_id:
+                existing_att.client_event_id = client_event_id
+        else:
+            db.session.add(Attendance(
+                student_id=student.id,
+                trip_id=trip.id,
+                bus_id=trip.bus_id,
+                client_event_id=client_event_id,
+                verification_status='VERIFIED',
+                scan_type='DROP',
+                is_dropped_off=True,
+                drop_verification_time=datetime.utcnow(),
+                verified_by_driver_id=trip.driver_id,
+                notes=f"{note_prefix} Drop-off (Confidence: {confidence}%)"
+            ))
+
+        if student.parent and student.parent.user:
+            db.session.add(Notification(
+                user_id=student.parent.user.id,
+                title="✅ Drop-Off Verified",
+                message=f"Your child {student.full_name} was scanned off {trip.bus.bus_code} at drop stop.",
+                category="SAFE_DROP"
+            ))
+
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return 'already_processed', {
+                'status': 'ALREADY_DROPPED',
+                'student_id': student.id,
+                'student_name': student.full_name,
+                'roll_number': student.roll_number,
+                'message': f"{student.full_name} drop-off already recorded on this trip.",
+            }, None
+        except Exception as exc:
+            db.session.rollback()
+            logger.error(f"Database failure recording DROP attendance ({type(exc).__name__})")
+            return 'retryable_failure', None, 'Database error recording drop-off attendance.'
+
+        return 'accepted', {
+            'status': 'DROP_VERIFIED',
+            'student_id': student.id,
+            'student_name': student.full_name,
+            'roll_number': student.roll_number,
+            'confidence': confidence,
+            'message': f"Student Drop Verified: {student.full_name} (BUS {trip.bus.bus_code})",
+        }, None
+
+    # BOARD flow
+    if existing_att:
+        return 'already_processed', {
+            'status': 'ALREADY_BOARDED',
+            'student_id': student.id,
+            'student_name': student.full_name,
+            'roll_number': student.roll_number,
+            'message': f"{student.full_name} is already verified and recorded on this trip.",
+        }, None
+
+    db.session.add(Attendance(
+        student_id=student.id,
+        trip_id=trip.id,
+        bus_id=trip.bus_id,
+        client_event_id=client_event_id,
+        verification_status='VERIFIED',
+        scan_type='BOARD',
+        verified_by_driver_id=trip.driver_id,
+        notes=f"{note_prefix} (Confidence: {confidence}%)"
+    ))
+
+    if student.parent and student.parent.user:
+        trip_time_str = datetime.now().strftime("%I:%M %p")
+        db.session.add(Notification(
+            user_id=student.parent.user.id,
+            title="🚌 Boarding Confirmed",
+            message=f"Your child {student.full_name} has boarded {trip.bus.bus_code} at {trip_time_str}.",
+            category="BOARDING"
+        ))
+
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return 'already_processed', {
+            'status': 'ALREADY_BOARDED',
+            'student_id': student.id,
+            'student_name': student.full_name,
+            'roll_number': student.roll_number,
+            'message': f"{student.full_name} is already verified and recorded on this trip.",
+        }, None
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(f"Database failure recording BOARD attendance ({type(exc).__name__})")
+        return 'retryable_failure', None, 'Database error recording boarding attendance.'
+
+    return 'accepted', {
+        'status': 'VERIFIED',
+        'student_id': student.id,
+        'student_name': student.full_name,
+        'roll_number': student.roll_number,
+        'confidence': confidence,
+        'message': f"Student Verified: {student.full_name} (BUS {trip.bus.bus_code})",
+    }, None
 
 @driver_bp.route('/dashboard')
 @login_required
@@ -122,149 +485,202 @@ def api_verify_face():
     if not driver:
         return jsonify({'status': 'ERROR', 'message': 'Driver profile not found'}), 403
 
-    data = request.get_json() or {}
-    image_b64 = data.get('image')
-    trip_id = data.get('trip_id')
+    data, err_resp = _parse_json_payload()
+    if err_resp:
+        return err_resp
 
-    if not image_b64 or not trip_id:
+    image_b64 = data.get('image')
+    trip_id_raw = data.get('trip_id')
+    scan_action = str(data.get('scan_action', 'BOARD')).strip().upper()
+    client_event_id, cid_err = _validate_client_event_id(data.get('client_event_id'))
+
+    if cid_err:
+        return jsonify({'status': 'ERROR', 'message': cid_err}), 400
+    if scan_action not in ('BOARD', 'DROP'):
+        return jsonify({'status': 'ERROR', 'message': 'Invalid scan_action. Must be BOARD or DROP.'}), 400
+    if not image_b64 or not isinstance(image_b64, str) or trip_id_raw is None:
         return jsonify({'status': 'ERROR', 'message': 'Missing image frame or trip ID'}), 400
 
-    trip = Trip.query.get(trip_id)
+    max_img_bytes = int(current_app.config.get('MAX_OFFLINE_IMAGE_SIZE_BYTES', 2 * 1024 * 1024))
+    if len(image_b64) > int(max_img_bytes * 1.4) + 128:
+        return jsonify({'status': 'ERROR', 'message': 'Image payload exceeds maximum allowed size.'}), 400
+
+    try:
+        trip_id = int(trip_id_raw)
+    except (ValueError, TypeError):
+        return jsonify({'status': 'ERROR', 'message': 'Invalid trip ID'}), 400
+
+    trip = db.session.get(Trip, trip_id)
     if not trip or trip.status != 'IN_PROGRESS':
         return jsonify({'status': 'ERROR', 'message': 'Active trip session not found'}), 400
 
-    # Authorization Check (C1 / SEC-01): Verify driver owns this trip
     if trip.driver_id != driver.id:
         return jsonify({'status': 'ERROR', 'message': 'Access Denied: You are not authorized for this trip session.'}), 403
+    if not trip.institution_id or (driver.institution_id and trip.institution_id != driver.institution_id) or (current_user.institution_id and trip.institution_id != current_user.institution_id):
+        return jsonify({'status': 'ERROR', 'message': 'Access Denied: Institution mismatch for trip session.'}), 403
 
-    result = identify_student_from_face(image_b64, active_trip_id=trip_id)
-
+    result = identify_student_from_face(image_b64, active_trip_id=trip.id, institution_id=trip.institution_id)
     if result['status'] != 'MATCHED':
         return jsonify(result)
 
     student = result['student']
     confidence = result['confidence']
-
-    # Check wrong bus
-    is_correct_bus, bus_reason, assigned_bus_code = check_bus_assignment(student.id, trip.bus_id)
-
-    if not is_correct_bus:
-        # WRONG BUS DETECTED!
-        alert = Alert(
-            institution_id=current_user.institution_id,
-            bus_id=trip.bus_id,
-            trip_id=trip.id,
-            student_id=student.id,
-            alert_type='WRONG_BUS',
-            risk_score=40,
-            severity='CRITICAL',
-            description=f"WRONG BUS DETECTED! Student {student.full_name} (Assigned: {assigned_bus_code}) boarded {trip.bus.bus_code}."
-        )
-        db.session.add(alert)
-
-        if student.parent and student.parent.user:
-            n = Notification(
-                user_id=student.parent.user.id,
-                title="🚨 WRONG BUS ALERT",
-                message=f"CRITICAL: Your child {student.full_name} was detected boarding BUS {trip.bus.bus_code} instead of assigned {assigned_bus_code}.",
-                category="WRONG_BUS"
-            )
-            db.session.add(n)
-
-        db.session.commit()
-
-        return jsonify({
-            'status': 'WRONG_BUS',
-            'student_id': student.id,
-            'student_name': student.full_name,
-            'assigned_bus': assigned_bus_code,
-            'current_bus': trip.bus.bus_code,
-            'message': f"WRONG BUS DETECTED! Assigned to {assigned_bus_code}, boarded {trip.bus.bus_code}.",
-            'confidence': confidence
-        })
-
-    scan_action = data.get('scan_action', 'BOARD').upper()
-
-    # Check duplicate attendance or handle drop scan
-    existing_att = Attendance.query.filter_by(student_id=student.id, trip_id=trip.id).first()
-
-    if scan_action == 'DROP':
-        if existing_att:
-            existing_att.is_dropped_off = True
-            existing_att.drop_verification_time = datetime.utcnow()
-            existing_att.scan_type = 'DROP'
-        else:
-            att = Attendance(
-                student_id=student.id,
-                trip_id=trip.id,
-                bus_id=trip.bus_id,
-                verification_status='VERIFIED',
-                scan_type='DROP',
-                is_dropped_off=True,
-                drop_verification_time=datetime.utcnow(),
-                verified_by_driver_id=trip.driver_id,
-                notes=f"AI Face Recognition Drop-off (Confidence: {confidence}%)"
-            )
-            db.session.add(att)
-
-        if student.parent and student.parent.user:
-            n = Notification(
-                user_id=student.parent.user.id,
-                title="✅ Drop-Off Verified",
-                message=f"Your child {student.full_name} was scanned off {trip.bus.bus_code} at drop stop.",
-                category="SAFE_DROP"
-            )
-            db.session.add(n)
-
-        db.session.commit()
-        return jsonify({
-            'status': 'DROP_VERIFIED',
-            'student_id': student.id,
-            'student_name': student.full_name,
-            'roll_number': student.roll_number,
-            'confidence': confidence,
-            'message': f"Student Drop Verified: {student.full_name} (BUS {trip.bus.bus_code})"
-        })
-
-    if existing_att:
-        return jsonify({
-            'status': 'ALREADY_BOARDED',
-            'student_name': student.full_name,
-            'message': f"{student.full_name} is already verified and recorded on this trip."
-        })
-
-    # VERIFIED! Record attendance
-    att = Attendance(
-        student_id=student.id,
-        trip_id=trip.id,
-        bus_id=trip.bus_id,
-        verification_status='VERIFIED',
-        scan_type='BOARD',
-        verified_by_driver_id=trip.driver_id,
-        notes=f"AI Face Recognition (Confidence: {confidence}%)"
+    outcome, payload, err_msg = _record_attendance_scan(
+        driver=driver,
+        trip=trip,
+        student=student,
+        confidence=confidence,
+        scan_action=scan_action,
+        client_event_id=client_event_id,
+        note_prefix="AI Face Recognition",
     )
-    db.session.add(att)
+    if outcome == 'retryable_failure':
+        return jsonify({'status': 'ERROR', 'result': 'retryable_failure', 'message': err_msg}), 500
+    if payload:
+        return jsonify(payload)
+    return jsonify({'status': 'ERROR', 'result': outcome, 'message': err_msg or 'Verification rejected.'}), 400
 
-    if student.parent and student.parent.user:
-        trip_time_str = datetime.now().strftime("%I:%M %p")
-        n = Notification(
-            user_id=student.parent.user.id,
-            title="🚌 Boarding Confirmed",
-            message=f"Your child {student.full_name} has boarded {trip.bus.bus_code} at {trip_time_str}.",
-            category="BOARDING"
-        )
-        db.session.add(n)
 
-    db.session.commit()
+def _process_offline_sos_item(driver, sos_item):
+    """Validate and process one offline SOS queue item with per-item idempotency."""
+    if not isinstance(sos_item, dict):
+        return {'id': None, 'type': 'SOS', 'status': 'rejected', 'message': 'Malformed SOS item.'}
 
-    return jsonify({
-        'status': 'VERIFIED',
-        'student_id': student.id,
-        'student_name': student.full_name,
-        'roll_number': student.roll_number,
-        'confidence': confidence,
-        'message': f"Student Verified: {student.full_name} (BUS {trip.bus.bus_code})"
-    })
+    raw_id = sos_item.get('client_event_id') if sos_item.get('client_event_id') is not None else sos_item.get('id')
+    client_event_id, cid_err = _validate_client_event_id(raw_id)
+    if cid_err:
+        return {'id': str(raw_id), 'type': 'SOS', 'status': 'rejected', 'message': cid_err}
+
+    trip, bus_id, inst_id, ctx_err, _ = _resolve_sos_context(
+        driver, sos_item.get('trip_id'), allowed_trip_statuses={'IN_PROGRESS', 'COMPLETED'}
+    )
+    if ctx_err:
+        return {'id': client_event_id, 'type': 'SOS', 'status': 'rejected', 'message': ctx_err}
+
+    lat_f, lng_f, coord_err = _validate_coordinates(sos_item.get('latitude'), sos_item.get('longitude'))
+    if coord_err:
+        return {'id': client_event_id, 'type': 'SOS', 'status': 'rejected', 'message': coord_err}
+
+    desc, desc_err = _validate_description(sos_item.get('description'), 'Emergency SOS triggered while offline')
+    if desc_err:
+        return {'id': client_event_id, 'type': 'SOS', 'status': 'rejected', 'message': desc_err}
+
+    triggered_at_dt, ts_err = _parse_iso_timestamp(sos_item.get('triggered_at'))
+    if ts_err:
+        return {'id': client_event_id, 'type': 'SOS', 'status': 'rejected', 'message': ts_err}
+
+    outcome, event_obj, msg = _persist_sos_event(
+        driver=driver,
+        trip=trip,
+        bus_id=bus_id,
+        inst_id=inst_id,
+        lat_f=lat_f,
+        lng_f=lng_f,
+        desc=desc,
+        triggered_at_dt=triggered_at_dt,
+        client_event_id=client_event_id,
+        is_offline=True,
+    )
+    result_status = 'already_processed' if outcome == 'duplicate' else outcome
+    return {
+        'id': client_event_id,
+        'type': 'SOS',
+        'status': result_status,
+        'event_id': event_obj.id if event_obj else None,
+        'message': msg,
+    }
+
+
+def _process_offline_attendance_item(driver, item):
+    """Validate and process one offline attendance queue item with per-item outcome."""
+    if not isinstance(item, dict):
+        return {'id': None, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Malformed queue item.'}
+
+    raw_id = item.get('client_event_id') if item.get('client_event_id') is not None else item.get('id')
+    client_event_id, cid_err = _validate_client_event_id(raw_id)
+    if cid_err:
+        return {'id': str(raw_id), 'type': 'ATTENDANCE', 'status': 'rejected', 'message': cid_err}
+
+    scan_action = str(item.get('scan_action', 'BOARD')).strip().upper()
+    if scan_action not in ('BOARD', 'DROP'):
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Invalid scan_action. Must be BOARD or DROP.'}
+
+    trip_id_raw = item.get('trip_id')
+    img_b64 = item.get('image')
+    if trip_id_raw is None or isinstance(trip_id_raw, bool) or not img_b64 or not isinstance(img_b64, str):
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Missing valid trip_id or image payload.'}
+
+    max_img_bytes = int(current_app.config.get('MAX_OFFLINE_IMAGE_SIZE_BYTES', 2 * 1024 * 1024))
+    if len(img_b64) > int(max_img_bytes * 1.4) + 128:
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Image payload exceeds maximum allowed size.'}
+
+    raw_ts = item.get('timestamp')
+    if raw_ts is not None and raw_ts != '':
+        ts_dt, ts_err = _parse_iso_timestamp(raw_ts)
+        if ts_err:
+            return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': ts_err}
+        expiry_hours = int(current_app.config.get('OFFLINE_QUEUE_EXPIRY_HOURS', 24))
+        if datetime.utcnow() - ts_dt > timedelta(hours=expiry_hours):
+            return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Queued attendance scan has expired.'}
+
+    try:
+        trip_id_int = int(trip_id_raw)
+    except (ValueError, TypeError):
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Invalid trip_id.'}
+
+    trip = db.session.get(Trip, trip_id_int)
+    if not trip:
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Trip reference not found.'}
+    if trip.driver_id != driver.id:
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Unauthorized trip ownership.'}
+    if trip.status != 'IN_PROGRESS':
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': f'Trip status {trip.status} is not valid for attendance sync.'}
+    if not trip.institution_id or (driver.institution_id and trip.institution_id != driver.institution_id) or (current_user.institution_id and trip.institution_id != current_user.institution_id):
+        return {'id': client_event_id, 'type': 'ATTENDANCE', 'status': 'rejected', 'message': 'Trip institution mismatch.'}
+
+    if client_event_id:
+        existing_by_event = Attendance.query.filter_by(
+            verified_by_driver_id=driver.id,
+            client_event_id=client_event_id
+        ).first()
+        if existing_by_event:
+            return {
+                'id': client_event_id,
+                'type': 'ATTENDANCE',
+                'scan_action': scan_action,
+                'status': 'already_processed',
+                'message': 'Attendance scan already processed.',
+            }
+
+    res = identify_student_from_face(img_b64, active_trip_id=trip.id, institution_id=trip.institution_id)
+    if res.get('status') != 'MATCHED':
+        return {
+            'id': client_event_id,
+            'type': 'ATTENDANCE',
+            'scan_action': scan_action,
+            'status': 'rejected',
+            'message': res.get('message', 'Face could not be matched.'),
+        }
+
+    st = res['student']
+    outcome, payload, err_msg = _record_attendance_scan(
+        driver=driver,
+        trip=trip,
+        student=st,
+        confidence=res.get('confidence', 0.0),
+        scan_action=scan_action,
+        client_event_id=client_event_id,
+        note_prefix="AI Face Scan (Offline Queue Auto-Synced)",
+    )
+    return {
+        'id': client_event_id,
+        'type': 'ATTENDANCE',
+        'scan_action': scan_action,
+        'status': outcome,
+        'student_id': st.id,
+        'student_name': st.full_name,
+        'message': (payload or {}).get('message') or err_msg or outcome,
+    }
 
 
 @driver_bp.route('/api/sync-offline-queue', methods=['POST'])
@@ -276,112 +692,57 @@ def api_sync_offline_queue():
     if not driver:
         return jsonify({'status': 'ERROR', 'message': 'Driver profile not found'}), 403
 
-    data = request.get_json() or {}
+    data, err_resp = _parse_json_payload()
+    if err_resp:
+        return err_resp
+
     queue = data.get('queue', [])
     sos_queue = data.get('sos_queue', [])
-    synced_count = 0
-    sos_synced_count = 0
+    if not isinstance(queue, list) or not isinstance(sos_queue, list):
+        return jsonify({'status': 'ERROR', 'message': 'queue and sos_queue must be arrays.'}), 400
 
+    max_items = int(current_app.config.get('MAX_OFFLINE_QUEUE_ITEMS', 50))
+    if len(queue) + len(sos_queue) > max_items:
+        return jsonify({'status': 'ERROR', 'message': f'Batch size exceeds maximum limit of {max_items} items.'}), 400
+
+    attendance_items = []
+    sos_items = list(sos_queue)
     for item in queue:
-        if item.get('type') == 'SOS':
-            sos_queue.append(item)
-            continue
-
-        img_b64 = item.get('image')
-        trip_id = item.get('trip_id')
-        if img_b64 and trip_id:
-            trip = Trip.query.get(trip_id)
-            # Authorization Check (C1): Verify driver owns trip
-            if trip and trip.driver_id == driver.id and trip.status == 'IN_PROGRESS':
-                res = identify_student_from_face(img_b64, active_trip_id=trip.id)
-                if res['status'] == 'MATCHED':
-                    st = res['student']
-                    
-                    # Full Wrong-Bus Safety Check during sync (C4 fix)
-                    is_correct_bus, bus_reason, assigned_bus_code = check_bus_assignment(st.id, trip.bus_id)
-                    if not is_correct_bus:
-                        alert = Alert(
-                            institution_id=current_user.institution_id,
-                            bus_id=trip.bus_id,
-                            trip_id=trip.id,
-                            student_id=st.id,
-                            alert_type='WRONG_BUS',
-                            risk_score=40,
-                            severity='CRITICAL',
-                            description=f"WRONG BUS DETECTED (Offline Sync)! Student {st.full_name} (Assigned: {assigned_bus_code}) boarded {trip.bus.bus_code}."
-                        )
-                        db.session.add(alert)
-                        continue
-
-                    existing = Attendance.query.filter_by(student_id=st.id, trip_id=trip.id).first()
-                    if not existing:
-                        att = Attendance(
-                            student_id=st.id,
-                            trip_id=trip.id,
-                            bus_id=trip.bus_id,
-                            verification_status='VERIFIED',
-                            verified_by_driver_id=trip.driver_id,
-                            notes=f"AI Face Scan (Offline Queue Auto-Synced)"
-                        )
-                        db.session.add(att)
-                        synced_count += 1
-
-    for sos_item in sos_queue:
-        trip_id = sos_item.get('trip_id')
-        lat = sos_item.get('latitude')
-        lng = sos_item.get('longitude')
-        desc = sos_item.get('description', 'Emergency SOS triggered while offline')
-        triggered_at_raw = sos_item.get('triggered_at')
-
-        trip = Trip.query.get(trip_id) if trip_id else None
-        if trip and trip.driver_id != driver.id:
-            continue
-        bus_id = trip.bus_id if trip else driver.assigned_bus_id
-
-        triggered_at_dt = None
-        if triggered_at_raw:
-            try:
-                triggered_at_dt = datetime.fromisoformat(str(triggered_at_raw).replace('Z', '+00:00'))
-            except Exception:
-                triggered_at_dt = datetime.utcnow()
+        if isinstance(item, dict) and str(item.get('type', '')).upper() == 'SOS':
+            sos_items.append(item)
         else:
-            triggered_at_dt = datetime.utcnow()
+            attendance_items.append(item)
 
-        sos_event = EmergencyEvent(
-            bus_id=bus_id,
-            trip_id=trip.id if trip else None,
-            triggered_by_user_id=current_user.id,
-            latitude=float(lat) if lat else None,
-            longitude=float(lng) if lng else None,
-            description=desc,
-            triggered_at=triggered_at_dt
-        )
-        db.session.add(sos_event)
+    attendance_results = [_process_offline_attendance_item(driver, item) for item in attendance_items]
+    sos_results = [_process_offline_sos_item(driver, sos_item) for sos_item in sos_items]
+    all_results = attendance_results + sos_results
 
-        bus_code = driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A'
-        inst_id = (trip.institution_id if trip else None) or driver.institution_id or current_user.institution_id
-        sos_alert = Alert(
-            institution_id=inst_id,
-            bus_id=bus_id,
-            trip_id=trip.id if trip else None,
-            alert_type='SOS_EMERGENCY',
-            risk_score=50,
-            severity='CRITICAL',
-            description=f"🚨 EMERGENCY SOS TRIGGERED (Offline Queue Synced) by Driver {current_user.full_name} for Bus {bus_code}. Triggered at {triggered_at_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}."
-        )
-        db.session.add(sos_alert)
+    synced_count = sum(1 for r in attendance_results if r['status'] == 'accepted')
+    sos_synced_count = sum(1 for r in sos_results if r['status'] == 'accepted')
+    accepted_count = sum(1 for r in all_results if r['status'] == 'accepted')
+    already_processed_count = sum(1 for r in all_results if r['status'] == 'already_processed')
+    rejected_count = sum(1 for r in all_results if r['status'] == 'rejected')
+    retryable_failure_count = sum(1 for r in all_results if r['status'] == 'retryable_failure')
 
-        from app.notifications.service import broadcast_admin_notification
-        broadcast_admin_notification(
-            title="🚨 CRITICAL EMERGENCY SOS (Offline Synced)",
-            message=f"Offline SOS Alert synced from Driver {current_user.full_name} on Bus {bus_code} (Triggered at {triggered_at_dt.strftime('%H:%M:%S UTC')}).",
-            category="EMERGENCY",
-            institution_id=inst_id
-        )
-        sos_synced_count += 1
+    if len(all_results) == 0 or (rejected_count == 0 and retryable_failure_count == 0):
+        overall_status = 'SUCCESS'
+    elif accepted_count > 0 or already_processed_count > 0:
+        overall_status = 'PARTIAL'
+    else:
+        overall_status = 'ERROR'
 
-    db.session.commit()
-    return jsonify({'status': 'SUCCESS', 'synced_count': synced_count, 'sos_synced_count': sos_synced_count})
+    return jsonify({
+        'status': overall_status,
+        'synced_count': synced_count,
+        'sos_synced_count': sos_synced_count,
+        'accepted_count': accepted_count,
+        'already_processed_count': already_processed_count,
+        'rejected_count': rejected_count,
+        'retryable_failure_count': retryable_failure_count,
+        'results': all_results,
+        'attendance_results': attendance_results,
+        'sos_results': sos_results,
+    }), 200
 
 
 @driver_bp.route('/manual-verify', methods=['POST'])
@@ -389,12 +750,16 @@ def api_sync_offline_queue():
 @role_required('DRIVER')
 def manual_verify():
     driver = Driver.query.filter_by(user_id=current_user.id).first()
+    if not driver:
+        flash('Driver profile not found.', 'danger')
+        return redirect(url_for('auth.login'))
+
     student_id = request.form.get('student_id')
     trip_id = request.form.get('trip_id')
     reason = request.form.get('reason', 'Driver Manual Override')
 
-    student = Student.query.get(student_id)
-    trip = Trip.query.get(trip_id)
+    student = db.session.get(Student, int(student_id)) if student_id and str(student_id).isdigit() else None
+    trip = db.session.get(Trip, int(trip_id)) if trip_id and str(trip_id).isdigit() else None
 
     if not student or not trip:
         flash('Invalid student or trip reference.', 'danger')
@@ -403,6 +768,10 @@ def manual_verify():
     if trip.driver_id != driver.id:
         flash('Unauthorized access: You cannot verify attendance on another driver\'s trip.', 'danger')
         return redirect(url_for('driver.dashboard'))
+
+    if trip.institution_id and student.institution_id and student.institution_id != trip.institution_id:
+        flash('Access Denied: Student does not belong to this trip\'s institution.', 'danger')
+        return redirect(url_for('driver.camera_verify'))
 
     existing = Attendance.query.filter_by(student_id=student.id, trip_id=trip.id).first()
     if not existing:
@@ -577,65 +946,70 @@ def api_gps_update():
 def api_trigger_sos():
     driver = Driver.query.filter_by(user_id=current_user.id).first()
     if not driver:
-        return jsonify({'status': 'ERROR', 'message': 'Driver profile not found'}), 403
+        return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': 'Driver profile not found'}), 403
 
-    data = request.get_json() or {}
-    trip_id = data.get('trip_id')
-    lat = data.get('latitude')
-    lng = data.get('longitude')
-    desc = data.get('description', 'Emergency SOS triggered by driver')
-    triggered_at_raw = data.get('triggered_at')
+    data, err_resp = _parse_json_payload()
+    if err_resp:
+        return err_resp
 
-    trip = Trip.query.get(trip_id) if trip_id else None
-    if trip and trip.driver_id != driver.id:
-        return jsonify({'status': 'ERROR', 'message': 'Access Denied: Unauthorized trip reference for SOS alert.'}), 403
-    bus_id = trip.bus_id if trip else driver.assigned_bus_id
+    raw_id = data.get('client_event_id') if data.get('client_event_id') is not None else data.get('id')
+    client_event_id, cid_err = _validate_client_event_id(raw_id)
+    if cid_err:
+        return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': cid_err}), 400
 
-    triggered_at_dt = None
-    if triggered_at_raw:
-        try:
-            triggered_at_dt = datetime.fromisoformat(str(triggered_at_raw).replace('Z', '+00:00'))
-        except Exception:
-            triggered_at_dt = datetime.utcnow()
-    else:
-        triggered_at_dt = datetime.utcnow()
+    trip, bus_id, inst_id, ctx_err, ctx_status = _resolve_sos_context(
+        driver, data.get('trip_id'), allowed_trip_statuses={'IN_PROGRESS'}
+    )
+    if ctx_err:
+        return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': ctx_err}), ctx_status
 
-    # Record emergency event
-    sos_event = EmergencyEvent(
+    lat_f, lng_f, coord_err = _validate_coordinates(data.get('latitude'), data.get('longitude'))
+    if coord_err:
+        return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': coord_err}), 400
+
+    desc, desc_err = _validate_description(data.get('description'), 'Emergency SOS triggered by driver')
+    if desc_err:
+        return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': desc_err}), 400
+
+    triggered_at_dt, ts_err = _parse_iso_timestamp(data.get('triggered_at'))
+    if ts_err:
+        return jsonify({'status': 'ERROR', 'result': 'rejected', 'message': ts_err}), 400
+
+    outcome, event_obj, msg = _persist_sos_event(
+        driver=driver,
+        trip=trip,
         bus_id=bus_id,
-        trip_id=trip.id if trip else None,
-        triggered_by_user_id=current_user.id,
-        latitude=float(lat) if lat else None,
-        longitude=float(lng) if lng else None,
-        description=desc,
-        triggered_at=triggered_at_dt
-    )
-    db.session.add(sos_event)
-
-    # Record Alert
-    inst_id = (trip.institution_id if trip else None) or driver.institution_id or current_user.institution_id
-    sos_alert = Alert(
-        institution_id=inst_id,
-        bus_id=bus_id,
-        trip_id=trip.id if trip else None,
-        alert_type='SOS_EMERGENCY',
-        risk_score=50,
-        severity='CRITICAL',
-        description=f"🚨 EMERGENCY SOS TRIGGERED by Driver {current_user.full_name} for Bus {driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A'}."
-    )
-    db.session.add(sos_alert)
-
-    # Broadcast to institutional Admins only
-    from app.notifications.service import broadcast_admin_notification
-    broadcast_admin_notification(
-        title="🚨 CRITICAL EMERGENCY SOS",
-        message=f"SOS Alert received from Driver {current_user.full_name} on Bus {driver.assigned_bus.bus_code if driver.assigned_bus else 'N/A'}.",
-        category="EMERGENCY",
-        institution_id=inst_id
+        inst_id=inst_id,
+        lat_f=lat_f,
+        lng_f=lng_f,
+        desc=desc,
+        triggered_at_dt=triggered_at_dt,
+        client_event_id=client_event_id,
+        is_offline=False,
     )
 
-    db.session.commit()
-    return jsonify({'status': 'SUCCESS', 'message': 'EMERGENCY SOS ALERT TRANSMITTED TO SCHOOL ADMIN'})
+    if outcome == 'accepted':
+        return jsonify({
+            'status': 'SUCCESS',
+            'result': 'accepted',
+            'event_id': event_obj.id,
+            'client_event_id': client_event_id,
+            'message': msg,
+        }), 200
+    if outcome == 'duplicate':
+        return jsonify({
+            'status': 'DUPLICATE',
+            'result': 'duplicate',
+            'event_id': event_obj.id,
+            'client_event_id': client_event_id,
+            'message': msg,
+        }), 200
+    return jsonify({
+        'status': 'ERROR',
+        'result': 'retryable_failure',
+        'client_event_id': client_event_id,
+        'message': msg,
+    }), 500
 
 
 def check_trip_no_shows(trip):

@@ -136,9 +136,12 @@ class Config:
     ABSENCE_CUTOFF_HOUR = int(os.environ.get('ABSENCE_CUTOFF_HOUR', 7))
     ABSENCE_CUTOFF_MINUTE = int(os.environ.get('ABSENCE_CUTOFF_MINUTE', 30))
     
-    # AI Feature Matching Thresholds
+    # AI Feature Matching Thresholds & Offline Queue Limits
     FACE_MATCH_SIMILARITY_THRESHOLD = 0.55  # Synchronized cosine distance threshold
     FACE_MIN_BOUNDING_BOX_SIZE = 60  # Minimum width/height in pixels for valid face region
+    MAX_OFFLINE_QUEUE_ITEMS = int(os.environ.get('MAX_OFFLINE_QUEUE_ITEMS', 50))
+    MAX_OFFLINE_IMAGE_SIZE_BYTES = int(os.environ.get('MAX_OFFLINE_IMAGE_SIZE_BYTES', 2 * 1024 * 1024))
+    OFFLINE_QUEUE_EXPIRY_HOURS = int(os.environ.get('OFFLINE_QUEUE_EXPIRY_HOURS', 24))
 
     # Outbound Email Configuration (Password Reset Delivery)
     EMAIL_PROVIDER = os.environ.get('EMAIL_PROVIDER', 'none').lower()  # 'none' (fail-closed) or 'smtp'

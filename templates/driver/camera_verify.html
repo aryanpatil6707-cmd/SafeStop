@@ -17,6 +17,18 @@
     <!-- Camera Feed Container -->
     <div class="row justify-content-center">
         <div class="col-md-7 col-lg-5">
+            <!-- Offline / Sync Status Banner -->
+            <div id="offline-sync-banner" class="d-none" role="status"></div>
+
+            <!-- Scan Action Mode Selector (BOARD vs DROP) -->
+            <div class="btn-group w-100 mb-3" role="group" aria-label="Scan Mode">
+                <input type="radio" class="btn-check" name="scan_action" id="mode-board" value="BOARD" {% if trip.trip_type != 'EVENING_DROP' %}checked{% endif %}>
+                <label class="btn btn-outline-success fw-semibold" for="mode-board"><i class="fa-solid fa-bus me-1"></i> Boarding Scan</label>
+
+                <input type="radio" class="btn-check" name="scan_action" id="mode-drop" value="DROP" {% if trip.trip_type == 'EVENING_DROP' %}checked{% endif %}>
+                <label class="btn btn-outline-info fw-semibold" for="mode-drop"><i class="fa-solid fa-house-circle-check me-1"></i> Drop-Off Scan</label>
+            </div>
+
             <!-- Scan Status Result Display Box -->
             <div id="scan-result-card" class="glass-card p-3 mb-3 text-center border-info">
                 <div class="h6 text-info mb-1"><i class="fa-solid fa-expand me-2"></i> Align Student Face</div>

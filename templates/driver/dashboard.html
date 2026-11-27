@@ -378,50 +378,118 @@ async function toggleDriverOnlineStatus() {
     }
 }
 
+const SOS_QUEUE_KEY = 'safestop_offline_sos_queue';
+
+function generateSosEventId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+    }
+    return `sos-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function queueOfflineSos(sosPayload) {
+    try {
+        const existing = JSON.parse(localStorage.getItem(SOS_QUEUE_KEY) || '[]');
+        const list = Array.isArray(existing) ? existing : [];
+        list.push(sosPayload);
+        localStorage.setItem(SOS_QUEUE_KEY, JSON.stringify(list));
+    } catch (e) {
+        console.warn("Unable to queue offline SOS:", e);
+    }
+}
+
+async function syncOfflineSosQueue() {
+    let items = [];
+    try {
+        const parsed = JSON.parse(localStorage.getItem(SOS_QUEUE_KEY) || '[]');
+        if (!Array.isArray(parsed) || parsed.length === 0) return;
+        items = parsed;
+    } catch (e) {
+        return;
+    }
+
+    try {
+        const res = await fetch('/driver/api/sync-offline-queue', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+            body: JSON.stringify({ sos_queue: items })
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const resultById = new Map((data.sos_results || []).map(r => [r.id, r]));
+        const remaining = items.filter(item => {
+            const r = resultById.get(item.client_event_id);
+            return !r || (r.status !== 'accepted' && r.status !== 'already_processed' && r.status !== 'rejected');
+        });
+        if (remaining.length === 0) {
+            localStorage.removeItem(SOS_QUEUE_KEY);
+        } else {
+            localStorage.setItem(SOS_QUEUE_KEY, JSON.stringify(remaining));
+        }
+    } catch (err) {
+        console.warn("Offline SOS sync deferred:", err);
+    }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
     if (isDriverOnline) {
         startMobileGpsTracking();
     }
+    window.addEventListener('online', syncOfflineSosQueue);
+    syncOfflineSosQueue();
 });
+
+async function dispatchSosPayload(payload) {
+    try {
+        const res = await fetch('/driver/api/trigger-sos', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && (data.result === 'accepted' || data.result === 'duplicate')) {
+            showInlineAlert("success", "🚨 EMERGENCY SOS CONFIRMED BY SERVER!");
+            setTimeout(() => window.location.reload(), 2500);
+        } else if (res.status >= 500 || data.result === 'retryable_failure') {
+            queueOfflineSos(payload);
+            showInlineAlert("error", (data.message || "Server error.") + " SOS queued for automatic retry.");
+        } else {
+            showInlineAlert("error", data.message || "SOS rejected by server.");
+        }
+    } catch (err) {
+        queueOfflineSos(payload);
+        showInlineAlert("error", "Network unreachable. SOS queued locally for automatic retry when online.");
+    }
+}
 
 function triggerSosNow() {
     const desc = document.getElementById('sos-desc').value || 'Driver Emergency SOS';
     const tripIdAttr = document.getElementById('driver-config')?.dataset.tripId;
     const tripId = tripIdAttr ? parseInt(tripIdAttr, 10) : null;
-    
-    if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(async (pos) => {
-            const payload = {
-                trip_id: tripId,
-                latitude: pos.coords.latitude,
-                longitude: pos.coords.longitude,
-                description: desc
-            };
+    const basePayload = {
+        client_event_id: generateSosEventId(),
+        trip_id: tripId,
+        description: desc,
+        triggered_at: new Date().toISOString()
+    };
 
-            try {
-                const res = await fetch('/driver/api/trigger-sos', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                    body: JSON.stringify(payload)
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+            (pos) => {
+                dispatchSosPayload({
+                    ...basePayload,
+                    latitude: pos.coords.latitude,
+                    longitude: pos.coords.longitude
                 });
-                showInlineAlert("success", "🚨 EMERGENCY SOS BROADCASTED TO SCHOOL TRANSPORT CENTER!");
-                setTimeout(() => window.location.reload(), 3000);
-            } catch (err) {
-                showInlineAlert("error", "Failed to reach server. Try again!");
-            }
-        }, (err) => {
-            showInlineAlert("warning", "Sending SOS with default location...");
-            fetch('/driver/api/trigger-sos', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                body: JSON.stringify({ trip_id: tripId, description: desc })
-            }).then(() => {
-                showInlineAlert("success", "🚨 SOS BROADCASTED!");
-                setTimeout(() => window.location.reload(), 3000);
-            });
-        }, { enableHighAccuracy: true });
+            },
+            () => {
+                showInlineAlert("warning", "GPS fix unavailable; transmitting SOS without coordinates...");
+                dispatchSosPayload(basePayload);
+            },
+            { enableHighAccuracy: true, timeout: 8000 }
+        );
     } else {
-        showInlineAlert("error", "Geolocation not supported.");
+        dispatchSosPayload(basePayload);
     }
 }
 </script>

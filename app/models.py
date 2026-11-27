@@ -331,12 +331,14 @@ class Attendance(BaseModel):
     __tablename__ = 'attendances'
     __table_args__ = (
         db.UniqueConstraint('student_id', 'trip_id', name='uq_student_trip_attendance'),
+        db.UniqueConstraint('verified_by_driver_id', 'client_event_id', name='uq_attendance_driver_client_event'),
     )
     
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('students.id'), nullable=False, index=True)
     trip_id = db.Column(db.Integer, db.ForeignKey('trips.id'), nullable=False, index=True)
     bus_id = db.Column(db.Integer, db.ForeignKey('buses.id'), nullable=False, index=True)
+    client_event_id = db.Column(db.String(100), nullable=True, index=True)
     
     verification_time = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     verification_status = db.Column(db.String(30), nullable=False, index=True)  # VERIFIED, WRONG_BUS, MANUAL_OVERRIDE, ABSENT
@@ -394,11 +396,16 @@ class Notification(BaseModel):
 
 class EmergencyEvent(BaseModel):
     __tablename__ = 'emergency_events'
+    __table_args__ = (
+        db.UniqueConstraint('triggered_by_user_id', 'client_event_id', name='uq_emergency_user_client_event'),
+    )
     
     id = db.Column(db.Integer, primary_key=True)
+    institution_id = db.Column(db.Integer, db.ForeignKey('institutions.id'), nullable=True, index=True)
     bus_id = db.Column(db.Integer, db.ForeignKey('buses.id'), nullable=False, index=True)
     trip_id = db.Column(db.Integer, db.ForeignKey('trips.id'), nullable=True, index=True)
     triggered_by_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    client_event_id = db.Column(db.String(100), nullable=True, index=True)
     latitude = db.Column(db.Float, nullable=True)
     longitude = db.Column(db.Float, nullable=True)
     status = db.Column(db.String(20), default='ACTIVE', index=True)  # ACTIVE, RESOLVED
